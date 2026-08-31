@@ -24,14 +24,12 @@ import org.alljoyn.bus.AboutListener;
 import org.alljoyn.bus.AboutObjectDescription;
 import org.alljoyn.bus.BusAttachment;
 import org.alljoyn.bus.BusException;
-import org.alljoyn.bus.Status;
 import org.alljoyn.bus.Variant;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import de.kaizencode.tchaikovsky.bus.SpeakerBusHandler;
 import de.kaizencode.tchaikovsky.bussignal.MediaPlayerSignalHandler;
-import de.kaizencode.tchaikovsky.exception.ConnectionException;
 import de.kaizencode.tchaikovsky.listener.SpeakerAnnouncedListener;
 import de.kaizencode.tchaikovsky.speaker.Speaker;
 import de.kaizencode.tchaikovsky.speaker.SpeakerDetails;
@@ -49,19 +47,19 @@ public class SpeakerAboutListener implements AboutListener {
 
     private final List<SpeakerAnnouncedListener> listeners = new CopyOnWriteArrayList<>();
     private final BusAttachment busAttachment;
-    private MediaPlayerSignalHandler signalHandler;
+    private final MediaPlayerSignalHandler signalHandler;
 
     /**
      * Constructor for a new About listener which is informed when a new speaker is discovered by the AllJoyn framework.
      * 
      * @param busAttachment
      *            The {@link BusAttachment} currently connected to
-     * @throws ConnectionException
-     *             if the listener cannot be created
+     * @param signalHandler
+     *            The {@link MediaPlayerSignalHandler} already registered on the {@link BusAttachment}
      */
-    public SpeakerAboutListener(BusAttachment busAttachment) throws ConnectionException {
+    public SpeakerAboutListener(BusAttachment busAttachment, MediaPlayerSignalHandler signalHandler) {
         this.busAttachment = busAttachment;
-        registerSignalHandler();
+        this.signalHandler = signalHandler;
     }
 
     @Override
@@ -107,16 +105,6 @@ public class SpeakerAboutListener implements AboutListener {
     public void removeSpeakerAnnouncedListener(SpeakerAnnouncedListener listener) {
         listeners.remove(listener);
         logger.debug("SpeakerAnnouncedListener " + listener.toString() + " has been removed");
-    }
-
-    private void registerSignalHandler() throws ConnectionException {
-        logger.debug("Registering signal handler");
-        signalHandler = new MediaPlayerSignalHandler(busAttachment);
-
-        Status status = busAttachment.registerSignalHandlers(signalHandler);
-        if (status != Status.OK) {
-            throw new ConnectionException("Error while registering signal handler on bus", status);
-        }
     }
 
     private void logObjectDescriptions(AboutObjectDescription[] objectDescriptions) {

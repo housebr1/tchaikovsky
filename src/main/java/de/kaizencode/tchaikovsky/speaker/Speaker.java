@@ -103,7 +103,7 @@ public interface Speaker {
     boolean ping(int timeoutInMs);
 
     /**
-     * Set the timeout for a session. Default is 120 seconds. AllJoyn defines 40 seconds as the minimum.
+     * Set the timeout for a session. Defaults to 40 seconds, which is also the minimum AllJoyn allows.
      * 
      * @param timeoutInSec
      *            Timeout for a session in seconds. If timeout occurs,

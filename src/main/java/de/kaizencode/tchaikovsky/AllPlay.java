@@ -24,6 +24,7 @@ import org.alljoyn.bus.Status;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import de.kaizencode.tchaikovsky.bussignal.MediaPlayerSignalHandler;
 import de.kaizencode.tchaikovsky.discovery.SpeakerAboutListener;
 import de.kaizencode.tchaikovsky.discovery.SpeakerBusListener;
 import de.kaizencode.tchaikovsky.exception.ConnectionException;
@@ -38,7 +39,7 @@ import de.kaizencode.tchaikovsky.listener.SpeakerAnnouncedListener;
 public class AllPlay {
 
     private final Logger logger = LoggerFactory.getLogger(AllPlay.class);
-    List<SpeakerAnnouncedListener> speakerAnnounedListeners = new CopyOnWriteArrayList<>();
+    List<SpeakerAnnouncedListener> speakerAnnouncedListeners = new CopyOnWriteArrayList<>();
 
     static {
         System.loadLibrary("alljoyn_java");
@@ -51,6 +52,7 @@ public class AllPlay {
     private BusAttachment busAttachment;
     private SpeakerAboutListener aboutListener;
     private SpeakerBusListener busListener;
+    private MediaPlayerSignalHandler signalHandler;
     private String applicationName = "Tchaikovsky";
 
     /**
@@ -83,9 +85,12 @@ public class AllPlay {
         busAttachment = new BusAttachment(applicationName, BusAttachment.RemoteMessage.Receive);
 
         connectToBus();
-        busListener = new SpeakerBusListener(busAttachment);
-        aboutListener = new SpeakerAboutListener(busAttachment);
-        for (SpeakerAnnouncedListener listener : speakerAnnounedListeners) {
+        // One handler shared by both discovery paths: registering a second one on the same
+        // BusAttachment only ever added a duplicate native registration that saw no sessions.
+        signalHandler = registerSignalHandler();
+        busListener = new SpeakerBusListener(busAttachment, signalHandler);
+        aboutListener = new SpeakerAboutListener(busAttachment, signalHandler);
+        for (SpeakerAnnouncedListener listener : speakerAnnouncedListeners) {
             aboutListener.addSpeakerAnnouncedListener(listener);
             busListener.addSpeakerAnnouncedListener(listener);
         }
@@ -105,7 +110,12 @@ public class AllPlay {
             }
             if (busListener != null) {
                 busAttachment.unregisterBusListener(busListener);
+                busListener.shutdown();
                 busListener = null;
+            }
+            if (signalHandler != null) {
+                busAttachment.unregisterSignalHandlers(signalHandler);
+                signalHandler = null;
             }
             if (busAttachment.isConnected()) {
                 busAttachment.disconnect();
@@ -197,7 +207,7 @@ public class AllPlay {
      *             if the listener cannot be added
      */
     public void addSpeakerAnnouncedListener(SpeakerAnnouncedListener listener) throws DiscoveryException {
-        speakerAnnounedListeners.add(listener);
+        speakerAnnouncedListeners.add(listener);
         if (aboutListener != null) {
             aboutListener.addSpeakerAnnouncedListener(listener);
         }
@@ -213,13 +223,23 @@ public class AllPlay {
      *            The listener to be removed
      */
     public void removeSpeakerAnnouncedListener(SpeakerAnnouncedListener listener) {
-        speakerAnnounedListeners.remove(listener);
+        speakerAnnouncedListeners.remove(listener);
         if (aboutListener != null) {
             aboutListener.removeSpeakerAnnouncedListener(listener);
         }
         if (busListener != null) {
             busListener.removeSpeakerAnnouncedListener(listener);
         }
+    }
+
+    private MediaPlayerSignalHandler registerSignalHandler() throws ConnectionException {
+        logger.debug("Registering signal handler");
+        MediaPlayerSignalHandler handler = new MediaPlayerSignalHandler(busAttachment);
+        Status status = busAttachment.registerSignalHandlers(handler);
+        if (status != Status.OK) {
+            throw new ConnectionException("Error while registering signal handler on bus", status);
+        }
+        return handler;
     }
 
     private void connectToBus() throws ConnectionException {

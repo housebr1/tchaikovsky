@@ -173,10 +173,18 @@ public class MediaPlayerSignalHandler {
     private Map<String, Integer> getSlaveMapWithoutPrefix(Map<String, Integer> slaves) {
         Map<String, Integer> slavesMap = new HashMap<>();
         for (Entry<String, Integer> entry : slaves.entrySet()) {
-            String key = entry.getKey().replaceFirst(AllPlay.WELL_KNOWN_NAME_PREFIX, "");
+            String key = stripWellKnownNamePrefix(entry.getKey());
             slavesMap.put(key, entry.getValue());
         }
         return slavesMap;
+    }
+
+    private String stripWellKnownNamePrefix(String name) {
+        // Deliberately not replaceFirst: the prefix contains dots, which are regex
+        // wildcards, and it must only be stripped from the start of the name.
+        return name.startsWith(AllPlay.WELL_KNOWN_NAME_PREFIX)
+                ? name.substring(AllPlay.WELL_KNOWN_NAME_PREFIX.length())
+                : name;
     }
 
 }

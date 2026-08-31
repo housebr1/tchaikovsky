@@ -19,6 +19,12 @@ package de.kaizencode.tchaikovsky.discovery;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.alljoyn.bus.AboutProxy;
 import org.alljoyn.bus.BusAttachment;
@@ -52,16 +58,52 @@ public class SpeakerBusListener extends BusListener {
 
     private final Logger logger = LoggerFactory.getLogger(SpeakerBusListener.class);
 
-    private BusAttachment busAttachment;
-    private final List<SpeakerAnnouncedListener> listeners = new CopyOnWriteArrayList<>();
-
-    private MediaPlayerSignalHandler signalHandler;
-
     private static final short PORT = 1;
+    private static final int DISCOVERY_THREADS = 4;
+    private static final int SHUTDOWN_TIMEOUT_IN_SEC = 5;
 
-    public SpeakerBusListener(BusAttachment busAttachment) throws ConnectionException {
+    private final BusAttachment busAttachment;
+    private final List<SpeakerAnnouncedListener> listeners = new CopyOnWriteArrayList<>();
+    private final MediaPlayerSignalHandler signalHandler;
+
+    /**
+     * Speaker details are fetched on this pool rather than on the calling thread, because
+     * foundAdvertisedName is invoked by the native library and calling back into it from the
+     * same thread deadlocks when several speakers are found at once. The pool is bounded so a
+     * burst of announcements cannot spawn threads without limit.
+     */
+    private final ExecutorService discoveryExecutor = Executors.newFixedThreadPool(DISCOVERY_THREADS,
+            new ThreadFactory() {
+                private final AtomicInteger threadCount = new AtomicInteger(1);
+
+                @Override
+                public Thread newThread(Runnable runnable) {
+                    Thread thread = new Thread(runnable, "tchaikovsky-discovery-" + threadCount.getAndIncrement());
+                    thread.setDaemon(true);
+                    return thread;
+                }
+            });
+
+    public SpeakerBusListener(BusAttachment busAttachment, MediaPlayerSignalHandler signalHandler) {
         this.busAttachment = busAttachment;
-        registerSignalHandler();
+        this.signalHandler = signalHandler;
+    }
+
+    /**
+     * Stops the discovery workers and waits for them to finish. The listener cannot be reused
+     * afterwards. Callers must let this return before releasing the {@link BusAttachment}, since a
+     * worker still in flight would otherwise use it after it has been released.
+     */
+    public void shutdown() {
+        discoveryExecutor.shutdownNow();
+        try {
+            if (!discoveryExecutor.awaitTermination(SHUTDOWN_TIMEOUT_IN_SEC, TimeUnit.SECONDS)) {
+                logger.warn("Discovery workers still running after " + SHUTDOWN_TIMEOUT_IN_SEC
+                        + "s, they may still be using the bus attachment");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     @Override
@@ -72,11 +114,11 @@ public class SpeakerBusListener extends BusListener {
             // foundAdvertisedName is called from the native library. If we call the native
             // library from here in the same thread, a deadlock might occur. This happens especially when multiple
             // speakers are found at almost the same time.
-            handleFoundSpeakerInNewThread(wellKnownName);
+            handleFoundSpeakerAsync(wellKnownName);
         }
     }
 
-    private void handleFoundSpeakerInNewThread(String wellKnownName) {
+    private void handleFoundSpeakerAsync(String wellKnownName) {
         Runnable run = new Runnable() {
             @Override
             public void run() {
@@ -90,7 +132,11 @@ public class SpeakerBusListener extends BusListener {
                 }
             }
         };
-        new Thread(run).start();
+        try {
+            discoveryExecutor.execute(run);
+        } catch (RejectedExecutionException e) {
+            logger.debug("Discovery already shut down, ignoring advertised name " + wellKnownName);
+        }
     }
 
     private SpeakerDetails createSpeakerDetails(String wellKnownName) throws AllPlayException {
@@ -146,16 +192,6 @@ public class SpeakerBusListener extends BusListener {
         sessionOpts.proximity = SessionOpts.PROXIMITY_ANY;
         sessionOpts.transports = SessionOpts.TRANSPORT_ANY;
         return sessionOpts;
-    }
-
-    private void registerSignalHandler() throws ConnectionException {
-        logger.debug("Registering signal handler");
-        signalHandler = new MediaPlayerSignalHandler(busAttachment);
-
-        Status status = busAttachment.registerSignalHandlers(signalHandler);
-        if (status != Status.OK) {
-            throw new ConnectionException("Error while registering signal handler on bus", status);
-        }
     }
 
     /**

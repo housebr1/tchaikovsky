@@ -1,0 +1,7 @@
+* text=auto
+
+# Must stay LF: it is executed as a shell script on Linux build hosts,
+# and CRLF would break the shebang.
+gradlew text eol=lf
+gradlew.bat text eol=crlf
+*.jar binary
