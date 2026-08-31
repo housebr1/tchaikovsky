@@ -1,34 +1,46 @@
-apply plugin: 'java'
-apply plugin: 'eclipse'
+plugins {
+    id 'java-library'
+    id 'eclipse'
+}
 
 repositories {
     mavenCentral()
 }
 
+java {
+    // Java 8 bytecode: the bundled AllJoyn binding is compiled for 8, and this keeps
+    // the jar runnable on the older JREs found on Raspberry Pi images. Compiles fine
+    // on any modern JDK.
+    sourceCompatibility = JavaVersion.VERSION_1_8
+    targetCompatibility = JavaVersion.VERSION_1_8
+
+    withSourcesJar()
+    withJavadocJar()
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = 8
+    options.encoding = 'UTF-8'
+}
+
+tasks.withType(Javadoc).configureEach {
+    options.encoding = 'UTF-8'
+    options.addStringOption('Xdoclint:none', '-quiet')
+}
+
 dependencies {
-    compile files('lib/alljoyn.jar')
-    compile 'org.slf4j:slf4j-api:1.7.+'
+    // AllJoyn is not published to Maven Central, so it ships in lib/.
+    // 'api' because org.alljoyn types appear in this library's public signatures.
+    api files('lib/alljoyn.jar')
+    implementation 'org.slf4j:slf4j-api:1.7.36'
 }
 
+// Fat jar: bundles the AllJoyn Java binding (and its runtime classpath) so the
+// artifact is self-contained apart from the native liballjoyn_java library.
 jar {
-  from {
-    configurations.compile.collect { it.isDirectory() ? it : zipTree(it) }
-  }
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    from {
+        configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) }
+    }
+    exclude 'META-INF/*.SF', 'META-INF/*.DSA', 'META-INF/*.RSA', 'META-INF/MANIFEST.MF'
 }
-
-
-task sourcesJar(type: Jar, dependsOn: classes) {
-    classifier = 'sources'
-    from sourceSets.main.allSource
-}
-
-task javadocJar(type: Jar, dependsOn: javadoc) {
-    classifier = 'javadoc'
-    from javadoc.destinationDir
-}
-
-artifacts {
-    archives sourcesJar
-    archives javadocJar
-}
-
