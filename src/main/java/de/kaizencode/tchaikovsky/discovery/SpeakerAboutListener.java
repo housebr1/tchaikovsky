@@ -16,9 +16,9 @@
  */
 package de.kaizencode.tchaikovsky.discovery;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 import org.alljoyn.bus.AboutListener;
 import org.alljoyn.bus.AboutObjectDescription;
@@ -47,7 +47,7 @@ public class SpeakerAboutListener implements AboutListener {
 
     private final Logger logger = LoggerFactory.getLogger(SpeakerAboutListener.class);
 
-    private final List<SpeakerAnnouncedListener> listeners = new ArrayList<>();
+    private final List<SpeakerAnnouncedListener> listeners = new CopyOnWriteArrayList<>();
     private final BusAttachment busAttachment;
     private MediaPlayerSignalHandler signalHandler;
 

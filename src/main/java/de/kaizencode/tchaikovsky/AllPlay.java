@@ -16,8 +16,8 @@
  */
 package de.kaizencode.tchaikovsky;
 
-import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 import org.alljoyn.bus.BusAttachment;
 import org.alljoyn.bus.Status;
@@ -38,7 +38,7 @@ import de.kaizencode.tchaikovsky.listener.SpeakerAnnouncedListener;
 public class AllPlay {
 
     private final Logger logger = LoggerFactory.getLogger(AllPlay.class);
-    List<SpeakerAnnouncedListener> speakerAnnounedListeners = new ArrayList<>();
+    List<SpeakerAnnouncedListener> speakerAnnounedListeners = new CopyOnWriteArrayList<>();
 
     static {
         System.loadLibrary("alljoyn_java");
@@ -99,11 +99,21 @@ public class AllPlay {
     public void disconnect() {
         if (busAttachment != null) {
             logger.debug("Disconnecting from AllJoyn bus " + busAttachment.getUniqueName());
-            busAttachment.unregisterAboutListener(aboutListener);
-            busAttachment.unregisterBusListener(busListener);
+            if (aboutListener != null) {
+                busAttachment.unregisterAboutListener(aboutListener);
+                aboutListener = null;
+            }
+            if (busListener != null) {
+                busAttachment.unregisterBusListener(busListener);
+                busListener = null;
+            }
             if (busAttachment.isConnected()) {
                 busAttachment.disconnect();
             }
+            // Frees the native resources straight away instead of leaving them to the finalizer.
+            // Without this, repeated reconnects exhaust the underlying file descriptors. Must be
+            // the last call made on this BusAttachment.
+            busAttachment.release();
             busAttachment = null;
         } else {
             logger.debug("Disconnect requested, but not connected to bus - ignoring");

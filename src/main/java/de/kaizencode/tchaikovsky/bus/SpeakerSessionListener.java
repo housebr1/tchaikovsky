@@ -16,8 +16,8 @@
  */
 package de.kaizencode.tchaikovsky.bus;
 
-import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 import org.alljoyn.bus.SessionListener;
 import org.slf4j.Logger;
@@ -33,7 +33,7 @@ import de.kaizencode.tchaikovsky.listener.SpeakerConnectionListener;
 public class SpeakerSessionListener extends SessionListener {
 
     private final Logger logger = LoggerFactory.getLogger(SpeakerSessionListener.class);
-    private final List<SpeakerConnectionListener> listeners = new ArrayList<>();
+    private final List<SpeakerConnectionListener> listeners = new CopyOnWriteArrayList<>();
 
     private String hostName;
 

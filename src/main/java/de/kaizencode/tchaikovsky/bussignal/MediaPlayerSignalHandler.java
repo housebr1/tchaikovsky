@@ -18,11 +18,11 @@ package de.kaizencode.tchaikovsky.bussignal;
 
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArraySet;
 
 import org.alljoyn.bus.BusAttachment;
 import org.alljoyn.bus.annotation.BusSignalHandler;
@@ -46,7 +46,7 @@ public class MediaPlayerSignalHandler {
 
     private final Logger logger = LoggerFactory.getLogger(MediaPlayerSignalHandler.class);
 
-    private final Set<SpeakerBusHandler> busHandlers = new HashSet<>();
+    private final Set<SpeakerBusHandler> busHandlers = new CopyOnWriteArraySet<>();
     private static final String MEDIA_PLAYER_INTERFACE = "de.kaizencode.tchaikovsky.businterface.MediaPlayerInterface";
     private static final String VOLUME_INTERFACE = "de.kaizencode.tchaikovsky.businterface.VolumeInterface";
     private static final String ZONEMANAGER_INTERFACE = "de.kaizencode.tchaikovsky.businterface.ZoneManagerInterface";

@@ -16,9 +16,9 @@
  */
 package de.kaizencode.tchaikovsky.discovery;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 import org.alljoyn.bus.AboutProxy;
 import org.alljoyn.bus.BusAttachment;
@@ -53,7 +53,7 @@ public class SpeakerBusListener extends BusListener {
     private final Logger logger = LoggerFactory.getLogger(SpeakerBusListener.class);
 
     private BusAttachment busAttachment;
-    private final List<SpeakerAnnouncedListener> listeners = new ArrayList<>();
+    private final List<SpeakerAnnouncedListener> listeners = new CopyOnWriteArrayList<>();
 
     private MediaPlayerSignalHandler signalHandler;
 

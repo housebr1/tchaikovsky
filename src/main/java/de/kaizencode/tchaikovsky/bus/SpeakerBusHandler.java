@@ -16,8 +16,8 @@
  */
 package de.kaizencode.tchaikovsky.bus;
 
-import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 import org.alljoyn.bus.BusAttachment;
 import org.alljoyn.bus.Mutable;
@@ -48,6 +48,7 @@ public class SpeakerBusHandler implements SpeakerConnectionListener {
     private final Logger logger = LoggerFactory.getLogger(SpeakerBusHandler.class);
 
     private static final String OBJECT_PATH = "/net/allplay/MediaPlayer";
+    private static final int NO_SESSION = -1;
 
     private final MediaPlayerSignalHandler signalHandler;
     private final BusAttachment busAttachment;
@@ -56,7 +57,7 @@ public class SpeakerBusHandler implements SpeakerConnectionListener {
     private Mutable.IntegerValue sessionId;
     private SpeakerSessionListener sessionListener;
 
-    private final List<SpeakerChangedListener> speakerChangedListeners = new ArrayList<>();
+    private final List<SpeakerChangedListener> speakerChangedListeners = new CopyOnWriteArrayList<>();
 
     /**
      * Creates a new {@link SpeakerBusHandler}.
@@ -93,7 +94,7 @@ public class SpeakerBusHandler implements SpeakerConnectionListener {
     }
 
     public int getSessionId() {
-        return this.sessionId.value;
+        return sessionId != null ? sessionId.value : NO_SESSION;
     }
 
     public List<SpeakerChangedListener> getSpeakerChangedListeners() {
@@ -104,9 +105,14 @@ public class SpeakerBusHandler implements SpeakerConnectionListener {
      * Disconnects from the speaker.
      */
     public void disconnect() {
+        if (sessionId == null) {
+            logger.debug("Disconnect requested for host " + hostName + ", but no session was joined - ignoring");
+            return;
+        }
         busAttachment.leaveSession(sessionId.value);
         signalHandler.removeSpeakerBusHandler(this);
         logger.info("Disconnected from session " + sessionId.value + " on host " + hostName);
+        sessionId = null;
     }
 
     /**
@@ -190,6 +196,11 @@ public class SpeakerBusHandler implements SpeakerConnectionListener {
      *            The timeout in seconds after which a session is declared as lost
      */
     public void setSessionTimeout(int timeoutInSec) {
+        if (sessionId == null) {
+            // No session yet. RemoteSpeaker keeps the value and re-applies it once the session is joined.
+            logger.debug("Session timeout set for host " + hostName + " before the session was joined - deferring");
+            return;
+        }
         busAttachment.setLinkTimeout(sessionId.value, new Mutable.IntegerValue(timeoutInSec));
     }
 
