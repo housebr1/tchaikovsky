@@ -1,0 +1,34 @@
+[Unit]
+Description=AllPlay zone controller (groups speakers onto the Icecast stream)
+Documentation=https://github.com/housebr1/tchaikovsky
+# Icecast must be up before we probe the mount. The controller tolerates the
+# mount 404ing, so this is ordering only, not a hard requirement.
+After=network-online.target icecast2.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/allplay
+
+# liballjoyn_java.so must be on java.library.path. The bundled router is used
+# by default; drop -Dorg.alljoyn.bus.address if you run a standalone
+# alljoyn-daemon instead, which discovers noticeably faster.
+ExecStart=/home/pi/jre17/bin/java \
+    -Xmx96m \
+    -Djava.library.path=/home/pi/allplay \
+    -Dorg.alljoyn.bus.address=null: \
+    -Dstream.url=http://127.0.0.1:8000/spotify.mp3 \
+    -Ddiscovery.seconds=30 \
+    -Dpoll.seconds=15 \
+    -cp /home/pi/allplay/tchaikovsky.jar:/home/pi/allplay \
+    AllPlayController
+
+Restart=always
+RestartSec=15
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
