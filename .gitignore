@@ -9,4 +9,3 @@ src/main/java/allplay/
 .gradle/
 native/core-alljoyn-*/
 native/*.zip
-native/prebuilt/

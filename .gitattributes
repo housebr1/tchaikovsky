@@ -10,3 +10,4 @@ native/Dockerfile text eol=lf
 gradlew.bat text eol=crlf
 *.jar binary
 *.so binary
+native/prebuilt/alljoyn-daemon binary
