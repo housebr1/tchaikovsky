@@ -42,6 +42,7 @@ docker run --rm --platform linux/arm/v7 -v "$PWD:/build" \
 
 Output lands in
 `core-alljoyn-RB16.04/build/linux/arm/release/dist/java/lib/liballjoyn_java.so`.
+A prebuilt copy is kept in `native/prebuilt/` (gitignored) when one has been built.
 Set `VARIANT=debug` for a build with tracing compiled in (release strips it,
 which hides failures on the transport startup path).
 

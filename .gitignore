@@ -8,5 +8,5 @@ lib/slf4j-simple-1.7.21.jar
 src/main/java/allplay/
 .gradle/
 native/core-alljoyn-*/
-native/*.so
 native/*.zip
+native/prebuilt/
