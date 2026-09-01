@@ -111,8 +111,15 @@ For unattended use the controller supervises its own state every `poll.seconds`:
 - **Regrouping** - the zone is rebuilt whenever the known speaker set changes.
 - **Backoff** - repeated failures back off up to two minutes instead of
   hammering the speakers and filling the journal.
-- **Clean shutdown** - stop, dissolve the zone, drop the speakers, then the bus,
-  in that order.
+- **Volume survives restarts** - volume, mute and band are persisted. librespot
+  only emits `volume_changed` when the slider actually moves, so without this a
+  restart resets to the default and nothing corrects it until someone touches
+  the slider; that presents as the speakers being inaudible after a reboot.
+- **Clean shutdown** - cleanup runs on SIGTERM rather than from a JVM shutdown
+  hook, because `alljoyn.jar` registers its own hook and JVM hooks run
+  concurrently in no defined order - so hook-based cleanup races AllJoyn tearing
+  the bus down and the zone release fails. It releases the zone, stops playback,
+  drops the speakers, then the bus.
 
 ## Options
 
@@ -126,6 +133,7 @@ For unattended use the controller supervises its own state every `poll.seconds`:
 | `volume.ceiling` | `100` | Top of the usable band, 0-100 |
 | `discovery.seconds` | `25` | Initial discovery window |
 | `poll.seconds` | `12` | Supervision interval |
+| `state.file` | `allplay.state` | Remembers volume/mute/band across restarts |
 | `org.alljoyn.bus.address` | `null:` | Router to use |
 
 A loopback host in `stream.url` is rewritten to this host's LAN address, since

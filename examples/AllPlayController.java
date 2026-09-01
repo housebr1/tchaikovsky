@@ -22,7 +22,11 @@
  *
  * Licensed under the Apache License, Version 2.0.
  */
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
@@ -42,6 +46,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
@@ -72,6 +77,8 @@ public class AllPlayController {
     private static final int CONTROL_PORT = Integer.getInteger("control.port", 8080);
     private static final int MAX_BACKOFF_SECONDS = 120;
     private static final int GRACE_SECONDS = 40;
+    private static final String STATE_FILE =
+            System.getProperty("state.file", "allplay.state");
 
     private static final Charset UTF8 = Charset.forName("UTF-8");
 
@@ -116,6 +123,7 @@ public class AllPlayController {
     }
 
     private void run() throws Exception {
+        loadState();
         connectBus();
         log("discovering for " + DISCOVERY_SECONDS + "s ...");
         firstSpeaker.await(DISCOVERY_SECONDS, TimeUnit.SECONDS);
@@ -256,6 +264,57 @@ public class AllPlayController {
      * zone master so the rooms match instead of inheriting whatever level each
      * was last left at physically.
      */
+    /**
+     * Remembers volume, mute and band across restarts.
+     *
+     * Without this every restart resets to the -Dvolume default and throws away
+     * where the Spotify slider actually is. librespot only emits volume_changed
+     * when the slider moves, so nothing corrects it until someone happens to
+     * touch it - which presents as the speakers being inaudible after a reboot.
+     */
+    private void saveState() {
+        try {
+            Properties props = new Properties();
+            props.setProperty("volume", Integer.toString(desiredVolume));
+            props.setProperty("muted", Boolean.toString(muted));
+            props.setProperty("volume.floor", Integer.toString(volumeFloor));
+            props.setProperty("volume.ceiling", Integer.toString(volumeCeiling));
+            OutputStream out = new FileOutputStream(STATE_FILE);
+            try {
+                props.store(out, "AllPlayController state; safe to delete");
+            } finally {
+                out.close();
+            }
+        } catch (Exception e) {
+            log("could not save state to " + STATE_FILE + ": " + e.getMessage());
+        }
+    }
+
+    private void loadState() {
+        File file = new File(STATE_FILE);
+        if (!file.isFile()) {
+            log("no saved state, starting at volume " + desiredVolume);
+            return;
+        }
+        try {
+            Properties props = new Properties();
+            InputStream in = new FileInputStream(file);
+            try {
+                props.load(in);
+            } finally {
+                in.close();
+            }
+            desiredVolume = Integer.parseInt(props.getProperty("volume", Integer.toString(desiredVolume)));
+            muted = Boolean.parseBoolean(props.getProperty("muted", Boolean.toString(muted)));
+            volumeFloor = Integer.parseInt(props.getProperty("volume.floor", Integer.toString(volumeFloor)));
+            volumeCeiling = Integer.parseInt(props.getProperty("volume.ceiling", Integer.toString(volumeCeiling)));
+            log("restored volume " + desiredVolume + (muted ? " (muted)" : "")
+                    + ", band " + volumeFloor + "-" + volumeCeiling);
+        } catch (Exception e) {
+            log("could not read state from " + STATE_FILE + " (" + e.getMessage() + "), using defaults");
+        }
+    }
+
     private void applyVolume() {
         for (Speaker speaker : speakers.values()) {
             if (!speaker.isConnected()) {
@@ -425,6 +484,7 @@ public class AllPlayController {
                 return "volume=" + desiredVolume + "\n";
             }
             applyVolume();
+            saveState();
             return "volume=" + desiredVolume + "\n";
         }
         if (path.startsWith("/band")) {
@@ -440,11 +500,13 @@ public class AllPlayController {
                 volumeCeiling = swap;
             }
             applyVolume();
+            saveState();
             return "band=" + volumeFloor + "-" + volumeCeiling + " volume=" + desiredVolume + "\n";
         }
         if (path.startsWith("/mute")) {
             muted = !q.containsKey("on") || Boolean.parseBoolean(q.get("on"));
             applyVolume();
+            saveState();
             return "muted=" + muted + "\n";
         }
         if (path.startsWith("/play")) {
