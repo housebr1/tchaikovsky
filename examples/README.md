@@ -65,10 +65,15 @@ journalctl -u allplay-controller -f
 
 ## Control endpoint
 
-The controller serves a plain-text control endpoint (default port 8080), because
-the Spotify slider cannot work: the librespot bridge runs with
-`LIBRESPOT_VOLUME_CTRL=fixed` and always emits full-scale PCM. The speakers are
-the only real volume control.
+The controller serves a plain-text control endpoint (default port 8080). Volume
+lives here rather than in the stream: it is applied to each speaker's own volume
+over AllJoyn — the same control the physical buttons drive — so it takes effect
+instantly and downstream of the MP3 encoder.
+
+The Spotify app's slider drives this endpoint too, via
+[`librespot-event.sh`](librespot-event.sh). See that script for the required
+`LIBRESPOT_*` settings and why `volume-ctrl=fixed` makes the slider inert while
+`log` with `volume-range 0.0` makes it work without attenuating the stream.
 
 ```sh
 curl http://<pi>:8080/status
@@ -83,6 +88,13 @@ curl http://<pi>:8080/play
 Volume is applied to each speaker individually, scaled into that speaker's own
 advertised range, so the rooms match rather than keeping whatever level each was
 last left at physically.
+
+`volume.floor`/`volume.ceiling` narrow the usable band: the 0–100 slider maps
+onto that slice of each speaker's range instead of the whole thing. The top of a
+speaker's range is usually far louder than anyone wants indoors, which leaves the
+useful adjustment crammed into the bottom of the slider. Tune it by ear with
+`/band?ceiling=N` — set the slider near maximum, then walk the ceiling down until
+full-slider is as loud as you would ever want.
 
 ## Robustness
 
