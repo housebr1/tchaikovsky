@@ -11,3 +11,4 @@ gradlew.bat text eol=crlf
 *.jar binary
 *.so binary
 native/prebuilt/alljoyn-daemon binary
+examples/pcm-pace text eol=lf

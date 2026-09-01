@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+"""Pace s16le 44100 stereo PCM to realtime without catching up after a stall.
+
+ffmpeg -re uses wall-clock from process start: after a Spotify pause of N
+seconds it burst-reads N seconds of audio so librespot's playhead jumps N
+seconds ahead, revealed the next time the app pauses. A token bucket with a
+small burst does not accumulate credit while the FIFO is idle.
+"""
+from __future__ import print_function
+
+import sys
+import time
+
+RATE = 44100 * 2 * 2  # bytes/s: 44100 Hz, 2 ch, s16le
+BURST = RATE * 0.1  # 100 ms of credit, not the pause duration
+CHUNK = 4096
+
+
+def main():
+    stdin = sys.stdin.buffer
+    stdout = sys.stdout.buffer
+    tokens = BURST
+    last = time.monotonic()
+    while True:
+        data = stdin.read(CHUNK)
+        if not data:
+            return 0
+        now = time.monotonic()
+        tokens = min(BURST, tokens + (now - last) * RATE)
+        last = now
+        need = len(data)
+        if tokens < need:
+            time.sleep((need - tokens) / RATE)
+            now = time.monotonic()
+            tokens = min(BURST, tokens + (now - last) * RATE)
+            last = now
+        tokens -= need
+        stdout.write(data)
+        stdout.flush()
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (BrokenPipeError, KeyboardInterrupt):
+        sys.exit(0)

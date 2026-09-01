@@ -50,7 +50,12 @@ import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.TimeUnit;
 
 import com.sun.net.httpserver.HttpExchange;
@@ -98,6 +103,26 @@ public class AllPlayController {
     private volatile long playbackStartedAt = 0;
     private int notPlayingStreak = 0;
     private final AtomicBoolean shuttingDown = new AtomicBoolean(false);
+    /** Set when the source reports it paused, so supervision does not restart it. */
+    private volatile boolean sourcePaused = false;
+    private static final long PAUSE_DEBOUNCE_MS = Long.getLong("pause.debounce.ms", 1500);
+    /** AllJoyn stop() can block; don't let one speaker hang pause forever. */
+    private static final long STOP_JOIN_MS = Long.getLong("pause.stop.join.ms", 4000);
+    private final ScheduledExecutorService timer = Executors.newSingleThreadScheduledExecutor(new ThreadFactory() {
+        public Thread newThread(Runnable r) {
+            Thread t = new Thread(r, "allplay-transport");
+            t.setDaemon(true);
+            return t;
+        }
+    });
+    private ScheduledFuture<?> pendingPause;
+    /**
+     * Bumped on every pause schedule and every cancel. The debounce runnable
+     * captures the value it was scheduled with and aborts if it no longer
+     * matches, so a late speaker.stop() cannot land after the user has already
+     * hit play (observed 17:31:39 resume, 17:31:40 stop).
+     */
+    private volatile int pauseEpoch = 0;
     /**
      * Usable slice of each speaker's range. The top of a speaker's range is
      * usually far louder than anyone wants indoors, which makes the whole slider
@@ -174,6 +199,13 @@ public class AllPlayController {
             reconnectBus();
             return;
         }
+        // The source told us it paused. Icecast still answers 200 because ffmpeg
+        // stays connected, so without this the loop sees a live stream plus
+        // streaming=false and starts playback straight back up - undoing the
+        // pause about ten seconds after it took effect.
+        if (sourcePaused) {
+            return;
+        }
         if (!isStreamLive()) {
             if (streaming) {
                 log("stream went away, will regroup when it returns");
@@ -182,7 +214,12 @@ public class AllPlayController {
             return;
         }
         if (!streaming) {
-            startPlayback();
+            // Prefer reopening the existing zone. startPlayback() always
+            // createZone()s, which is the audible tear-down pause/play was doing
+            // on every resume.
+            if (!reopenStream("supervise")) {
+                startPlayback();
+            }
         } else if (!speakers.keySet().equals(zonedIds)) {
             // Discovery is asynchronous and speakers appear well after the
             // initial window, so regroup when the known set changes.
@@ -220,8 +257,15 @@ public class AllPlayController {
                 log("master reported " + state + ", confirming on next pass");
                 return;
             }
-            log("master is " + state + " while the stream is live, restarting playback");
             notPlayingStreak = 0;
+            // Try re-opening the stream on the zone we already have before
+            // resorting to a rebuild. A lone STOPPED master is usually the
+            // speaker having dropped the HTTP body, and createZone() is the
+            // expensive, audible response - it regrouped twice in two minutes
+            // when a skip left the master briefly stopped.
+            if (reopenStream("watchdog (" + state + ")")) {
+                return;
+            }
             streaming = false;
         } catch (AllPlayException e) {
             log("could not read play state (" + e.getMessage() + "), regrouping");
@@ -231,7 +275,7 @@ public class AllPlayController {
     }
 
     /** Connects every speaker, groups them behind one master and starts the stream. */
-    private void startPlayback() throws AllPlayException {
+    private synchronized void startPlayback() throws AllPlayException {
         if (speakers.isEmpty()) {
             throw new IllegalStateException("no speakers discovered yet");
         }
@@ -261,7 +305,18 @@ public class AllPlayController {
                 + " slaves=" + slaveIds.size());
 
         chosen.playItem(STREAM_URL);
-        zonedIds = grouped;
+        // Record every speaker considered, not just those that grouped. A
+        // speaker that is discoverable but refuses to join a session (seen as
+        // ALLJOYN_JOINSESSION_REPLY_FAILED) would otherwise keep the known set
+        // permanently larger than the zoned set, so the membership check would
+        // rebuild the zone on every pass - tearing playback down and back up
+        // every poll.seconds indefinitely. A genuinely new speaker still
+        // changes this set and triggers a regroup.
+        zonedIds = new HashSet<String>(speakers.keySet());
+        if (grouped.size() < speakers.size()) {
+            log("grouped " + grouped.size() + " of " + speakers.size()
+                    + " speaker(s); the others are retried when the set changes");
+        }
         streaming = true;
         playbackStartedAt = System.currentTimeMillis();
         notPlayingStreak = 0;
@@ -427,6 +482,194 @@ public class AllPlayController {
         log("bus reconnected, rediscovering speakers");
     }
 
+    /**
+     * Stops the speakers only if the source is still paused after the debounce.
+     * Cancelled by resume, so transient paused events during track changes do
+     * not interrupt playback.
+     *
+     * Stopping five speakers over AllJoyn takes longer than the debounce, so
+     * cancel() alone is not enough: the runnable may already be inside stop().
+     * An epoch plus a re-check before each stop, and a reopen if we already
+     * stopped anyone after being cancelled, closes that window.
+     */
+    private synchronized void schedulePause() {
+        cancelPendingPause();
+        final int epoch = pauseEpoch;
+        pendingPause = timer.schedule(new Runnable() {
+            public void run() {
+                applyPause(epoch);
+            }
+        }, PAUSE_DEBOUNCE_MS, TimeUnit.MILLISECONDS);
+    }
+
+    private synchronized void cancelPendingPause() {
+        pauseEpoch++;
+        if (pendingPause != null) {
+            pendingPause.cancel(false);
+            pendingPause = null;
+        }
+    }
+
+    private boolean stillThisPause(int epoch) {
+        return sourcePaused && epoch == pauseEpoch;
+    }
+
+    private void applyPause(int epoch) {
+        if (!stillThisPause(epoch)) {
+            return;
+        }
+        int stopped = stopSpeakersParallel(epoch);
+        synchronized (this) {
+            if (!stillThisPause(epoch)) {
+                recoverInterruptedPause(stopped);
+                return;
+            }
+            streaming = false;
+            pendingPause = null;
+            log("source paused, stopped " + stopped + " speaker(s)");
+        }
+    }
+
+    /**
+     * stop() every connected speaker at once. Sequential stops took several
+     * seconds per room, so a 4-10s pause/play always landed inside stop()
+     * (and a hung AllJoyn call at 18:00 left paused=true with streaming=true).
+     */
+    private int stopSpeakersParallel(final int epoch) {
+        List<Speaker> targets = new ArrayList<Speaker>();
+        for (Speaker speaker : speakers.values()) {
+            if (speaker.isConnected()) {
+                targets.add(speaker);
+            }
+        }
+        if (targets.isEmpty()) {
+            return 0;
+        }
+        final AtomicInteger stopped = new AtomicInteger(0);
+        List<Thread> threads = new ArrayList<Thread>();
+        for (final Speaker speaker : targets) {
+            Thread thread = new Thread(new Runnable() {
+                public void run() {
+                    if (!stillThisPause(epoch)) {
+                        return;
+                    }
+                    try {
+                        speaker.stop();
+                        stopped.incrementAndGet();
+                    } catch (Exception e) {
+                        log("could not stop " + speaker.getName() + ": " + e.getMessage());
+                    }
+                    if (!stillThisPause(epoch) && !sourcePaused) {
+                        reopenStream("late stop after resume");
+                    }
+                }
+            }, "allplay-stop-" + speaker.getName().replace(' ', '-'));
+            thread.setDaemon(true);
+            thread.start();
+            threads.add(thread);
+        }
+        long deadline = System.currentTimeMillis() + STOP_JOIN_MS;
+        for (int i = 0; i < threads.size(); i++) {
+            long wait = deadline - System.currentTimeMillis();
+            if (wait < 0) {
+                wait = 0;
+            }
+            try {
+                threads.get(i).join(wait);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        int alive = 0;
+        for (int i = 0; i < threads.size(); i++) {
+            if (threads.get(i).isAlive()) {
+                alive++;
+            }
+        }
+        if (alive > 0) {
+            log("pause: " + alive + " speaker stop(s) still running after "
+                    + STOP_JOIN_MS + "ms, continuing");
+        }
+        return stopped.get();
+    }
+
+    /**
+     * Resume cancelled us after we had already stopped some speakers, and
+     * /resume is a no-op while streaming is still true. Put those speakers
+     * back on the live URL without rebuilding the zone.
+     */
+    private void recoverInterruptedPause(int stopped) {
+        if (stopped <= 0 || sourcePaused) {
+            return;
+        }
+        log("pause interrupted after stopping " + stopped + " speaker(s), reopening");
+        reopenStream("pause interrupted");
+    }
+
+    /**
+     * Re-opens STREAM_URL on the existing zone. Returns false if there is no
+     * connected master, so the caller can fall back to createZone().
+     *
+     * Skip, resume and the watchdog all need this: createZone() is what made
+     * pause/play mint a new zone id every time (~17:11-17:12).
+     */
+    private synchronized boolean reopenStream(String reason) {
+        Speaker current = master;
+        if (current == null || !current.isConnected()) {
+            return false;
+        }
+        try {
+            current.playItem(STREAM_URL);
+            streaming = true;
+            playbackStartedAt = System.currentTimeMillis();
+            notPlayingStreak = 0;
+            log(reason + ": reopened stream on " + current.getName() + " (zone kept)");
+            return true;
+        } catch (Exception e) {
+            log(reason + " reopen failed (" + e.getMessage() + ")");
+            streaming = false;
+            return false;
+        }
+    }
+
+    /**
+     * Clears a source pause and starts the speakers again if they are down.
+     * While streaming is still true the in-flight debounce is cancelled by
+     * epoch; if it already stopped anyone it reopens them itself.
+     */
+    private String resumeFromSource(String reason) {
+        sourcePaused = false;
+        cancelPendingPause();
+        if (streaming) {
+            return "resumed\n";
+        }
+        if (reopenStream(reason)) {
+            return "resumed\n";
+        }
+        resumeNow();
+        return "resumed\n";
+    }
+
+    /** Full startPlayback() off the HTTP thread when there is no zone yet. */
+    private void resumeNow() {
+        timer.execute(new Runnable() {
+            public void run() {
+                try {
+                    if (sourcePaused || streaming || !isStreamLive()) {
+                        return;
+                    }
+                    if (!reopenStream("resume")) {
+                        startPlayback();
+                    }
+                } catch (Exception e) {
+                    log("resume failed (" + e.getMessage() + "), supervision will retry");
+                    streaming = false;
+                }
+            }
+        });
+    }
+
     /** Icecast returns 404 on the mount until a source connects to it. */
     private boolean isStreamLive() {
         HttpURLConnection connection = null;
@@ -476,7 +719,7 @@ public class AllPlayController {
             server.setExecutor(null);
             server.start();
             log("control endpoint on http://0.0.0.0:" + CONTROL_PORT
-                    + "  (/status /volume?level=N /volume?delta=N /band?ceiling=N /mute?on=true /play /stop)");
+                    + "  (/status /volume /band /mute /pause /resume /skip /seek /play /stop)");
         } catch (IOException e) {
             log("could not start control endpoint: " + e.getMessage());
         }
@@ -521,9 +764,52 @@ public class AllPlayController {
             saveState();
             return "muted=" + muted + "\n";
         }
+        // Pause has to reach the speakers, not just the source. Stopping the
+        // source only stops refilling the pipeline, so the speakers keep playing
+        // whatever they have already buffered - measured at 15-20s here, most of
+        // it inside the speakers themselves where it cannot be tuned away.
+        //
+        // stop() rather than pause() because a paused speaker keeps its buffer
+        // and would resume on stale audio. Dropping it means resume restarts
+        // from live, at the cost of a short re-buffer.
+        // librespot emits transient "paused" during track transitions - observed
+        // playing at :54 and paused at :56 mid-playback - so acting immediately
+        // stops the speakers in the middle of normal listening. Defer the stop
+        // and cancel it if playback resumes, which costs a little pause latency
+        // and makes the behaviour correct.
+        if (path.startsWith("/pause")) {
+            sourcePaused = true;
+            log("pause requested, debouncing " + PAUSE_DEBOUNCE_MS + "ms");
+            schedulePause();
+            return "pause scheduled in " + PAUSE_DEBOUNCE_MS + "ms\n";
+        }
+        // Resume has to act now. Deferring to the supervision loop meant up to
+        // poll.seconds of silence after pressing play. Do the reopen on this
+        // thread so streaming=true before we return; otherwise superviseOnce
+        // races us and playItem()s twice.
+        if (path.startsWith("/resume")) {
+            return resumeFromSource("resume");
+        }
+        // Skip and seek: re-open the stream URL on the existing zone. The
+        // speakers hold 15-20s of the previous track (or the pre-seek position)
+        // and nothing else makes them drop it. Deliberately does NOT
+        // createZone(): rebuilding the zone is the audible tear-down that made
+        // skipping worse than leaving it alone.
+        if (path.startsWith("/skip") || path.startsWith("/seek")) {
+            String reason = path.startsWith("/seek") ? "seek" : "skip";
+            if (sourcePaused) {
+                return "paused, " + reason + " ignored (resume will start from the new position)\n";
+            }
+            if (!streaming) {
+                return "not streaming, " + reason + " deferred to the next pass\n";
+            }
+            if (reopenStream(reason)) {
+                return ("seek".equals(reason) ? "seeked\n" : "skipped\n");
+            }
+            return reason + " failed, supervision will recover\n";
+        }
         if (path.startsWith("/play")) {
-            streaming = false;
-            return "playback will restart on the next supervision pass\n";
+            return resumeFromSource("play");
         }
         if (path.startsWith("/stop")) {
             Speaker current = master;
@@ -542,6 +828,7 @@ public class AllPlayController {
         sb.append("stream    ").append(STREAM_URL).append('\n');
         sb.append("live      ").append(isStreamLive()).append('\n');
         sb.append("streaming ").append(streaming).append('\n');
+        sb.append("paused    ").append(sourcePaused).append(" (reported by source)\n");
         sb.append("master    ").append(current == null ? "-" : current.getName()).append('\n');
         sb.append("volume    ").append(desiredVolume).append(muted ? " (muted)" : "").append('\n');
         sb.append("failures  ").append(consecutiveFailures).append('\n');

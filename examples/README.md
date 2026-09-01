@@ -70,10 +70,17 @@ lives here rather than in the stream: it is applied to each speaker's own volume
 over AllJoyn — the same control the physical buttons drive — so it takes effect
 instantly and downstream of the MP3 encoder.
 
-The Spotify app's slider drives this endpoint too, via
-[`librespot-event.sh`](librespot-event.sh). See that script for the required
-`LIBRESPOT_*` settings and why `volume-ctrl=fixed` makes the slider inert while
-`log` with `volume-range 0.0` makes it work without attenuating the stream.
+The Spotify app drives this endpoint too, via
+[`librespot-event.sh`](librespot-event.sh): volume, pause, resume, skip and
+seek. See that script for the required `LIBRESPOT_*` settings and why
+`volume-ctrl=fixed` makes the slider inert while `log` with `volume-range 1.0`
+makes it work without attenuating the stream. (`0.0` is rejected by librespot
+and silently falls back to linear.)
+
+The Icecast feeder must read the PCM FIFO at realtime without catching up after
+a stall — that is [`pcm-pace`](pcm-pace), not ffmpeg `-re`. `-re` burst-reads
+the pause duration on resume and the Spotify scrubber jumps by that amount on
+the next pause.
 
 ```sh
 curl http://<pi>:8080/status
@@ -81,6 +88,10 @@ curl "http://<pi>:8080/volume?level=30"   # absolute, 0-100
 curl "http://<pi>:8080/volume?delta=-5"  # relative
 curl "http://<pi>:8080/band?ceiling=45"   # cap the usable band
 curl "http://<pi>:8080/mute?on=true"
+curl http://<pi>:8080/pause
+curl http://<pi>:8080/resume
+curl http://<pi>:8080/skip
+curl http://<pi>:8080/seek
 curl http://<pi>:8080/stop
 curl http://<pi>:8080/play
 ```
