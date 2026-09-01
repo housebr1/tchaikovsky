@@ -1,7 +1,12 @@
 * text=auto
 
-# Must stay LF: it is executed as a shell script on Linux build hosts,
-# and CRLF would break the shebang.
+# Must stay LF: consumed by Linux tooling (shell, docker build, patch) where
+# CRLF breaks shebangs, line continuations, or patch application against
+# LF-only upstream sources.
 gradlew text eol=lf
+*.sh text eol=lf
+*.patch text eol=lf
+native/Dockerfile text eol=lf
 gradlew.bat text eol=crlf
 *.jar binary
+*.so binary

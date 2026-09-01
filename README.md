@@ -5,8 +5,10 @@ Please note that while the AllJoyn framework is able to connect to a variety of 
 
 ## Native library
 All the AllJoyn functionality is available through a native C++ library. When using Tchaikovsky, you need to have this library in path specified by java.library.path, else it will not work.
-There are two options for getting hold of the native library: Either extract it from a precompiled SDK, or download the source code and compile it yourself. Both source code and SDKs are available at [https://allseenalliance.org/framework/download](https://allseenalliance.org/framework/download). 
+There are two options for getting hold of the native library: Either extract it from a precompiled SDK, or download the source code and compile it yourself. The AllSeen Alliance download site is no longer available -- that domain has been re-registered and is unrelated -- so the source now comes from the GitHub mirror at [alljoyn/core-alljoyn](https://github.com/alljoyn/core-alljoyn).
 Tchaikovsky has been successfully tested with the dll extracted from the Windows 15.04.00b SDK as well as with the Standard Core Source 16.04.00 compiled on a Raspberry Pi 2.
+
+See [native/README.md](native/README.md) for a reproducible build of `liballjoyn_java.so` for 32-bit Raspberry Pi OS. Building AllJoyn 16.04 with a modern toolchain and running it on a current kernel needs a small patch set, which is included there.
 
 ## Usage
 

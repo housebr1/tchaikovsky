@@ -1,0 +1,74 @@
+--- a/build_core/conf/linux/SConscript	2017-02-24 02:37:26.000000000 -0500
++++ b/build_core/conf/linux/SConscript	2026-08-31 17:42:42.571737500 -0400
+@@ -46,10 +46,10 @@
+ 
+ # Linux specific flags
+ env.Append(CPPDEFINES = ['QCC_OS_LINUX'])
+-env.Append(CPPDEFINES = ['_GLIBCXX_USE_C99_FP_MACROS_DYNAMIC'])
+ 
+ env.Append(CFLAGS = ['-Wall',
+-                     '-Werror',
++                     '-fPIC',
++                     '-Wno-error',
+                      '-pipe',
+                      '-std=c99',
+                      '-fno-strict-aliasing',
+@@ -61,7 +61,8 @@
+                      '-Wunused-parameter'])
+ 
+ env.Append(CXXFLAGS = ['-Wall',
+-                       '-Werror',
++                       '-fPIC',
++                       '-Wno-error',
+                        '-pipe',
+                        '-fno-exceptions',
+                        '-fno-strict-aliasing',
+--- a/build_core/conf/linux/arm/SConscript	2017-02-24 02:37:26.000000000 -0500
++++ b/build_core/conf/linux/arm/SConscript	2026-08-31 16:47:51.512387500 -0400
+@@ -30,8 +30,9 @@
+ import os
+ 
+ # Linux specific flags
+-env.Append(CPPFLAGS=['-march=armv6',
+-                     '-mthumb-interwork'])
++env.Append(CPPFLAGS=['-march=armv7-a',
++                     '-mfpu=vfpv3-d16',
++                     '-mfloat-abi=hard'])
+ 
+ # Use the OpenEmbedded cross-compilation environment
+ vars = Variables()
+--- a/common/os/posix/IfConfigLinux.cc	2017-02-24 02:37:26.000000000 -0500
++++ b/common/os/posix/IfConfigLinux.cc	2026-08-31 21:11:02.145786800 -0400
+@@ -332,13 +332,28 @@
+             return nBytes;
+         }
+ 
+-        struct nlmsghdr* p = (struct nlmsghdr*)&buffer[nBytes];
+-
+-        if (p->nlmsg_type == NLMSG_DONE) {
+-            break;
++        //
++        // Scan every message in the datagram just read for NLMSG_DONE, not only
++        // the first one.  Modern kernels coalesce the terminating NLMSG_DONE into
++        // the same datagram as the last data message; checking only the first
++        // header misses it and the following recv() then blocks forever.  Both
++        // callers already ignore NLMSG_DONE/NLMSG_ERROR entries, so it is safe
++        // to include this datagram in the returned length.
++        //
++        bool done = false;
++        int len = tmp;
++        for (struct nlmsghdr* p = (struct nlmsghdr*)&buffer[nBytes]; NLMSG_OK(p, len); p = NLMSG_NEXT(p, len)) {
++            if (p->nlmsg_type == NLMSG_DONE || p->nlmsg_type == NLMSG_ERROR) {
++                done = true;
++                break;
++            }
+         }
+ 
+         nBytes += tmp;
++
++        if (done) {
++            break;
++        }
+     }
+ 
+     return nBytes;
