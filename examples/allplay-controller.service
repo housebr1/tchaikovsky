@@ -1,8 +1,8 @@
 [Unit]
 Description=AllPlay zone controller (groups speakers onto the Icecast stream)
 Documentation=https://github.com/housebr1/tchaikovsky
-# Icecast must be up before we probe the mount. The controller tolerates the
-# mount 404ing, so this is ordering only, not a hard requirement.
+# Ordering only. The controller tolerates the mount 404ing and waits for it, so
+# Icecast being slow to start is not a failure.
 After=network-online.target icecast2.service
 Wants=network-online.target
 
@@ -12,23 +12,44 @@ User=pi
 Group=pi
 WorkingDirectory=/home/pi/allplay
 
-# liballjoyn_java.so must be on java.library.path. The bundled router is used
-# by default; drop -Dorg.alljoyn.bus.address if you run a standalone
-# alljoyn-daemon instead, which discovers noticeably faster.
+# liballjoyn_java.so must be on java.library.path.
+#
+# org.alljoyn.bus.address=null: uses the router bundled into the .so. Remove it
+# if you run a standalone alljoyn-daemon, which discovers faster.
+#
+# stream.url may name loopback; the controller rewrites it to this host's LAN
+# address, because the speakers fetch the stream from their own machines.
+#
+# Volume is set here rather than in Spotify: the librespot bridge runs with
+# LIBRESPOT_VOLUME_CTRL=fixed and always emits full-scale PCM, so the app's
+# slider does nothing. Change it at runtime via the control endpoint.
 ExecStart=/home/pi/jre17/bin/java \
     -Xmx96m \
     -Djava.library.path=/home/pi/allplay \
     -Dorg.alljoyn.bus.address=null: \
     -Dstream.url=http://127.0.0.1:8000/spotify.mp3 \
-    -Ddiscovery.seconds=30 \
-    -Dpoll.seconds=15 \
+    -Dvolume=30 \
+    -Dcontrol.port=8080 \
+    -Ddiscovery.seconds=25 \
+    -Dpoll.seconds=12 \
     -cp /home/pi/allplay/tchaikovsky.jar:/home/pi/allplay \
     AllPlayController
 
 Restart=always
 RestartSec=15
+# Give the shutdown hook time to stop playback, dissolve the zone and drop the
+# speakers cleanly; killing it early leaves the speakers grouped and playing.
+TimeoutStopSec=45
+KillSignal=SIGTERM
+
+# The Pi Zero 2 W has ~424 MB usable. Cap the service so a leak cannot take the
+# audio pipeline down with it.
+MemoryMax=220M
+
 StandardOutput=journal
 StandardError=journal
+# AllJoyn's native layer logs heavily on teardown; keep it from flooding.
+SyslogIdentifier=allplay
 
 [Install]
 WantedBy=multi-user.target
