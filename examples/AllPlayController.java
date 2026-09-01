@@ -117,6 +117,18 @@ public class AllPlayController {
         log("bus address = " + System.getProperty("org.alljoyn.bus.address"));
         log("stream url  = " + STREAM_URL);
 
+        // Everything the controller reports goes to stdout, so stderr can be
+        // discarded to drop AllJoyn's native teardown flood. Route anything that
+        // would otherwise die silently on stderr through the same channel.
+        Thread.setDefaultUncaughtExceptionHandler(new Thread.UncaughtExceptionHandler() {
+            public void uncaughtException(Thread thread, Throwable error) {
+                log("UNCAUGHT on " + thread.getName() + ": " + error);
+                for (StackTraceElement frame : error.getStackTrace()) {
+                    log("    at " + frame);
+                }
+            }
+        });
+
         final AllPlayController controller = new AllPlayController();
         controller.installTerminationHandler();
         controller.run();

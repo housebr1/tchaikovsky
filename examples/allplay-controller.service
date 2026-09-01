@@ -20,10 +20,14 @@ WorkingDirectory=/home/pi/allplay
 # stream.url may name loopback; the controller rewrites it to this host's LAN
 # address, because the speakers fetch the stream from their own machines.
 #
-# volume.ceiling caps the usable band: the 0-100 slider maps onto 0-35 of each
-# speaker's range, because the top of that range is far louder than these rooms
-# need and leaving it in crams all the useful adjustment into the bottom of the
-# slider. Tuned by ear; adjust live with /band?ceiling=N.
+# The volume band maps the 0-100 slider onto 8-35 of each speaker's range. The
+# ceiling is there because the top of the range is far louder than these rooms
+# need; the floor because the bottom of the slider otherwise goes inaudible
+# before it reaches zero. Both tuned by ear; adjust live with /band.
+#
+# These three are only first-run defaults. Live changes are persisted to
+# allplay.state in the working directory and restored on startup, so whatever
+# you set by ear survives reboots and these values are not consulted again.
 #
 # The Spotify app's slider drives the same endpoint via librespot-event.sh.
 ExecStart=/home/pi/jre17/bin/java \
@@ -31,7 +35,8 @@ ExecStart=/home/pi/jre17/bin/java \
     -Djava.library.path=/home/pi/allplay \
     -Dorg.alljoyn.bus.address=null: \
     -Dstream.url=http://127.0.0.1:8000/spotify.mp3 \
-    -Dvolume=30 \
+    -Dvolume=75 \
+    -Dvolume.floor=8 \
     -Dvolume.ceiling=35 \
     -Dcontrol.port=8080 \
     -Ddiscovery.seconds=25 \
@@ -54,14 +59,16 @@ KillSignal=SIGTERM
 MemoryMax=220M
 
 StandardOutput=journal
-StandardError=journal
 SyslogIdentifier=allplay
-# AllJoyn's native layer emits thousands of errors from its router threads while
-# the bus is torn down - roughly 2900 lines per stop, measured. The controller's
-# own logging is a few lines per minute, so this bound is generous for normal
-# operation while keeping a restart from flooding the journal.
-LogRateLimitIntervalSec=10s
-LogRateLimitBurst=400
+# AllJoyn's native layer writes thousands of errors to stderr from its router
+# threads while the bus is torn down. The controller logs everything it cares
+# about on stdout, including an uncaught-exception handler, so dropping stderr
+# removes the flood without losing anything the controller reports.
+#
+# Rate limiting was tried first and was worse: the native burst consumed the
+# allowance before the controller's own startup output, so journald reported
+# "Suppressed 6830 messages" and the useful lines were the ones lost.
+StandardError=null
 
 [Install]
 WantedBy=multi-user.target
