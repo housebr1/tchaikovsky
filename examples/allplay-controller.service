@@ -20,15 +20,19 @@ WorkingDirectory=/home/pi/allplay
 # stream.url may name loopback; the controller rewrites it to this host's LAN
 # address, because the speakers fetch the stream from their own machines.
 #
-# Volume is set here rather than in Spotify: the librespot bridge runs with
-# LIBRESPOT_VOLUME_CTRL=fixed and always emits full-scale PCM, so the app's
-# slider does nothing. Change it at runtime via the control endpoint.
+# volume.ceiling caps the usable band: the 0-100 slider maps onto 0-35 of each
+# speaker's range, because the top of that range is far louder than these rooms
+# need and leaving it in crams all the useful adjustment into the bottom of the
+# slider. Tuned by ear; adjust live with /band?ceiling=N.
+#
+# The Spotify app's slider drives the same endpoint via librespot-event.sh.
 ExecStart=/home/pi/jre17/bin/java \
     -Xmx96m \
     -Djava.library.path=/home/pi/allplay \
     -Dorg.alljoyn.bus.address=null: \
     -Dstream.url=http://127.0.0.1:8000/spotify.mp3 \
     -Dvolume=30 \
+    -Dvolume.ceiling=35 \
     -Dcontrol.port=8080 \
     -Ddiscovery.seconds=25 \
     -Dpoll.seconds=12 \
@@ -37,6 +41,9 @@ ExecStart=/home/pi/jre17/bin/java \
 
 Restart=always
 RestartSec=15
+# A JVM stopped by SIGTERM exits 143 (128+15). Without this systemd records a
+# clean stop as "Failed with result 'exit-code'".
+SuccessExitStatus=143
 # Give the shutdown hook time to stop playback, dissolve the zone and drop the
 # speakers cleanly; killing it early leaves the speakers grouped and playing.
 TimeoutStopSec=45
@@ -48,8 +55,13 @@ MemoryMax=220M
 
 StandardOutput=journal
 StandardError=journal
-# AllJoyn's native layer logs heavily on teardown; keep it from flooding.
 SyslogIdentifier=allplay
+# AllJoyn's native layer emits thousands of errors from its router threads while
+# the bus is torn down - roughly 2900 lines per stop, measured. The controller's
+# own logging is a few lines per minute, so this bound is generous for normal
+# operation while keeping a restart from flooding the journal.
+LogRateLimitIntervalSec=10s
+LogRateLimitBurst=400
 
 [Install]
 WantedBy=multi-user.target
