@@ -103,11 +103,27 @@ public class AllPlayController {
     private volatile long playbackStartedAt = 0;
     private int notPlayingStreak = 0;
     private final AtomicBoolean shuttingDown = new AtomicBoolean(false);
-    /** Set when the source reports it paused, so supervision does not restart it. */
-    private volatile boolean sourcePaused = false;
+    /**
+     * True until the source reports playing. Starts true so a live-but-silent
+     * Icecast mount (ffmpeg connected, FIFO idle) does not make us playItem()
+     * on boot — that pointed the speakers at a dead HTTP body (18:44:19) and
+     * the first real track was silent.
+     */
+    private volatile boolean sourcePaused = true;
     private static final long PAUSE_DEBOUNCE_MS = Long.getLong("pause.debounce.ms", 1500);
+    /** librespot emits paused immediately after playing on session start. */
+    private static final long PAUSE_IGNORE_AFTER_RESUME_MS =
+            Long.getLong("pause.ignore.after.resume.ms", 2500);
+    private volatile long lastResumeAt = 0;
     /** AllJoyn stop() can block; don't let one speaker hang pause forever. */
     private static final long STOP_JOIN_MS = Long.getLong("pause.stop.join.ms", 4000);
+    /**
+     * Interrupted pause can finish stop() on every speaker after resume, each
+     * calling playItem() (observed 6 reopens in one second at 18:14:11). Skip
+     * and seek do not use this window.
+     */
+    private static final long REOPEN_COALESCE_MS = Long.getLong("reopen.coalesce.ms", 750);
+    private long lastReopenAt = 0;
     private final ScheduledExecutorService timer = Executors.newSingleThreadScheduledExecutor(new ThreadFactory() {
         public Thread newThread(Runnable r) {
             Thread t = new Thread(r, "allplay-transport");
@@ -304,7 +320,7 @@ public class AllPlayController {
         log("zone " + zone.getZoneId() + " master=" + chosen.getName()
                 + " slaves=" + slaveIds.size());
 
-        chosen.playItem(STREAM_URL);
+        chosen.playItem(liveStreamUrl());
         // Record every speaker considered, not just those that grouped. A
         // speaker that is discoverable but refuses to join a session (seen as
         // ALLJOYN_JOINSESSION_REPLY_FAILED) would otherwise keep the known set
@@ -319,6 +335,7 @@ public class AllPlayController {
         }
         streaming = true;
         playbackStartedAt = System.currentTimeMillis();
+        lastResumeAt = playbackStartedAt;
         notPlayingStreak = 0;
         applyVolume();
         log("playing " + STREAM_URL + " on " + grouped.size() + " speaker(s) at volume "
@@ -560,7 +577,7 @@ public class AllPlayController {
                         log("could not stop " + speaker.getName() + ": " + e.getMessage());
                     }
                     if (!stillThisPause(epoch) && !sourcePaused) {
-                        reopenStream("late stop after resume");
+                        reopenStream("late stop after resume", true);
                     }
                 }
             }, "allplay-stop-" + speaker.getName().replace(' ', '-'));
@@ -571,8 +588,9 @@ public class AllPlayController {
         long deadline = System.currentTimeMillis() + STOP_JOIN_MS;
         for (int i = 0; i < threads.size(); i++) {
             long wait = deadline - System.currentTimeMillis();
-            if (wait < 0) {
-                wait = 0;
+            // Thread.join(0) waits forever. After the deadline, stop waiting.
+            if (wait <= 0) {
+                break;
             }
             try {
                 threads.get(i).join(wait);
@@ -604,7 +622,7 @@ public class AllPlayController {
             return;
         }
         log("pause interrupted after stopping " + stopped + " speaker(s), reopening");
-        reopenStream("pause interrupted");
+        reopenStream("pause interrupted", true);
     }
 
     /**
@@ -615,12 +633,22 @@ public class AllPlayController {
      * pause/play mint a new zone id every time (~17:11-17:12).
      */
     private synchronized boolean reopenStream(String reason) {
+        return reopenStream(reason, false);
+    }
+
+    private synchronized boolean reopenStream(String reason, boolean coalesce) {
         Speaker current = master;
         if (current == null || !current.isConnected()) {
             return false;
         }
+        long now = System.currentTimeMillis();
+        if (coalesce && streaming && now - lastReopenAt < REOPEN_COALESCE_MS) {
+            log(reason + ": coalesced reopen on " + current.getName());
+            return true;
+        }
         try {
-            current.playItem(STREAM_URL);
+            current.playItem(liveStreamUrl());
+            lastReopenAt = now;
             streaming = true;
             playbackStartedAt = System.currentTimeMillis();
             notPlayingStreak = 0;
@@ -634,12 +662,24 @@ public class AllPlayController {
     }
 
     /**
+     * Cache-bust so playItem() is never the same URL the speakers already have.
+     * AllPlay treats a repeat playItem of the identical URL as a no-op, which
+     * is why a long pause whose stop() timed out (stopped 0) stayed silent on
+     * resume until the user skipped.
+     */
+    private String liveStreamUrl() {
+        char sep = STREAM_URL.indexOf('?') >= 0 ? '&' : '?';
+        return STREAM_URL + sep + "t=" + System.currentTimeMillis();
+    }
+
+    /**
      * Clears a source pause and starts the speakers again if they are down.
      * While streaming is still true the in-flight debounce is cancelled by
      * epoch; if it already stopped anyone it reopens them itself.
      */
     private String resumeFromSource(String reason) {
         sourcePaused = false;
+        lastResumeAt = System.currentTimeMillis();
         cancelPendingPause();
         if (streaming) {
             return "resumed\n";
@@ -651,23 +691,46 @@ public class AllPlayController {
         return "resumed\n";
     }
 
-    /** Full startPlayback() off the HTTP thread when there is no zone yet. */
+    /**
+     * startPlayback() off the HTTP thread when there is no zone yet, or when
+     * Icecast is not live. A long pause lets Icecast drop the source
+     * (source-timeout); ffmpeg then dies with a broken pipe on the next PCM and
+     * systemd restarts it. A single isStreamLive() check at that moment fails
+     * and we used to wait until the next supervision pass (~12s). That was the
+     * ~15s from pressing play to sound. Retry here on a dedicated thread so we
+     * do not block the pause timer.
+     */
     private void resumeNow() {
-        timer.execute(new Runnable() {
+        Thread thread = new Thread(new Runnable() {
             public void run() {
-                try {
-                    if (sourcePaused || streaming || !isStreamLive()) {
+                for (int attempt = 0; attempt < 20; attempt++) {
+                    if (sourcePaused || streaming) {
                         return;
                     }
-                    if (!reopenStream("resume")) {
-                        startPlayback();
+                    try {
+                        if (isStreamLive()) {
+                            if (!reopenStream("resume")) {
+                                startPlayback();
+                            }
+                            return;
+                        }
+                    } catch (Exception e) {
+                        log("resume failed (" + e.getMessage() + "), supervision will retry");
+                        streaming = false;
+                        return;
                     }
-                } catch (Exception e) {
-                    log("resume failed (" + e.getMessage() + "), supervision will retry");
-                    streaming = false;
+                    try {
+                        Thread.sleep(500);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
                 }
+                log("resume: stream not live after 10s, supervision will retry");
             }
-        });
+        }, "allplay-resume");
+        thread.setDaemon(true);
+        thread.start();
     }
 
     /** Icecast returns 404 on the mount until a source connects to it. */
@@ -778,6 +841,11 @@ public class AllPlayController {
         // and cancel it if playback resumes, which costs a little pause latency
         // and makes the behaviour correct.
         if (path.startsWith("/pause")) {
+            long sinceResume = System.currentTimeMillis() - lastResumeAt;
+            if (lastResumeAt > 0 && sinceResume < PAUSE_IGNORE_AFTER_RESUME_MS) {
+                log("ignoring pause " + sinceResume + "ms after resume");
+                return "pause ignored (just resumed)\n";
+            }
             sourcePaused = true;
             log("pause requested, debouncing " + PAUSE_DEBOUNCE_MS + "ms");
             schedulePause();

@@ -15,6 +15,11 @@
 #
 # Skip still needs the controller to playItem() so the speakers drop their
 # own 15-20s HTTP buffer.
+#
+# Icecast source-timeout must be far longer than a pause (86400 on this host).
+# The default 300s drops the source while ffmpeg is blocked on an idle FIFO;
+# the next PCM then hits a dead socket, ffmpeg dies, and first play waits for
+# a systemd restart plus the controller's poll.
 set -euo pipefail
 
 FIFO="/var/lib/raspotify/spotify.pcm"

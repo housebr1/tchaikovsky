@@ -5,26 +5,38 @@ ffmpeg -re uses wall-clock from process start: after a Spotify pause of N
 seconds it burst-reads N seconds of audio so librespot's playhead jumps N
 seconds ahead, revealed the next time the app pauses. A token bucket with a
 small burst does not accumulate credit while the FIFO is idle.
+
+When the FIFO is idle (Spotify paused), write silence at the same rate so
+ffmpeg keeps the Icecast connection alive. Otherwise the next real PCM hits a
+dead socket, ffmpeg dies (broken pipe), and the first track is silent until
+the encoder restarts.
 """
 from __future__ import print_function
 
+import os
+import select
 import sys
 import time
 
 RATE = 44100 * 2 * 2  # bytes/s: 44100 Hz, 2 ch, s16le
 BURST = RATE * 0.1  # 100 ms of credit, not the pause duration
 CHUNK = 4096
+SILENCE = b"\x00" * CHUNK
 
 
 def main():
-    stdin = sys.stdin.buffer
+    infd = sys.stdin.fileno()
     stdout = sys.stdout.buffer
     tokens = BURST
     last = time.monotonic()
     while True:
-        data = stdin.read(CHUNK)
-        if not data:
-            return 0
+        ready, _, _ = select.select([infd], [], [], 0.02)
+        if ready:
+            data = os.read(infd, CHUNK)
+            if not data:
+                data = SILENCE
+        else:
+            data = SILENCE
         now = time.monotonic()
         tokens = min(BURST, tokens + (now - last) * RATE)
         last = now
