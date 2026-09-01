@@ -86,6 +86,14 @@ public class AllPlayController {
     /** Speakers report STOPPED briefly while they fetch and buffer the stream. */
     private volatile long playbackStartedAt = 0;
     private int notPlayingStreak = 0;
+    /**
+     * Usable slice of each speaker's range. The top of a speaker's range is
+     * usually far louder than anyone wants indoors, which makes the whole slider
+     * twitchy; narrowing the band spreads the same 0-100 across a smaller span.
+     * Runtime-adjustable so it can be tuned by ear without a restart.
+     */
+    private volatile int volumeFloor = Integer.getInteger("volume.floor", 0);
+    private volatile int volumeCeiling = Integer.getInteger("volume.ceiling", 100);
 
     public static void main(String[] args) throws Exception {
         // Without this, BusAttachment.connect() defaults to unix:abstract=alljoyn
@@ -268,12 +276,21 @@ public class AllPlayController {
         }
     }
 
-    /** Maps 0-100 onto a speaker's advertised range. */
-    private static int scaleToRange(int percent, VolumeRange range) {
+    /**
+     * Maps 0-100 onto a speaker's advertised range, constrained to the usable
+     * band [volumeFloor, volumeCeiling].
+     *
+     * The band exists because a speaker's full range is rarely all usable
+     * indoors: the top of it is far louder than anyone wants, which makes the
+     * whole slider twitchy. Narrowing the band spreads the same 0-100 slider
+     * across a smaller, more usable span so small movements stay small.
+     */
+    private int scaleToRange(int percent, VolumeRange range) {
         int min = range.getMin();
         int max = range.getMax();
         int clamped = Math.max(0, Math.min(100, percent));
-        return min + (int) Math.round((max - min) * (clamped / 100.0));
+        double banded = volumeFloor + (volumeCeiling - volumeFloor) * (clamped / 100.0);
+        return min + (int) Math.round((max - min) * (banded / 100.0));
     }
 
     private boolean connect(Speaker speaker) {
@@ -388,7 +405,7 @@ public class AllPlayController {
             server.setExecutor(null);
             server.start();
             log("control endpoint on http://0.0.0.0:" + CONTROL_PORT
-                    + "  (/status /volume?level=N /volume?delta=N /mute?on=true /play /stop)");
+                    + "  (/status /volume?level=N /volume?delta=N /band?ceiling=N /mute?on=true /play /stop)");
         } catch (IOException e) {
             log("could not start control endpoint: " + e.getMessage());
         }
@@ -409,6 +426,21 @@ public class AllPlayController {
             }
             applyVolume();
             return "volume=" + desiredVolume + "\n";
+        }
+        if (path.startsWith("/band")) {
+            if (q.containsKey("floor")) {
+                volumeFloor = Math.max(0, Math.min(100, Integer.parseInt(q.get("floor"))));
+            }
+            if (q.containsKey("ceiling")) {
+                volumeCeiling = Math.max(0, Math.min(100, Integer.parseInt(q.get("ceiling"))));
+            }
+            if (volumeCeiling < volumeFloor) {
+                int swap = volumeFloor;
+                volumeFloor = volumeCeiling;
+                volumeCeiling = swap;
+            }
+            applyVolume();
+            return "band=" + volumeFloor + "-" + volumeCeiling + " volume=" + desiredVolume + "\n";
         }
         if (path.startsWith("/mute")) {
             muted = !q.containsKey("on") || Boolean.parseBoolean(q.get("on"));
@@ -442,10 +474,23 @@ public class AllPlayController {
         if (!lastError.isEmpty()) {
             sb.append("lastError ").append(lastError).append('\n');
         }
+        sb.append("band      ").append(volumeFloor).append('-').append(volumeCeiling)
+          .append(" of each speaker's range\n");
         sb.append("speakers  ").append(speakers.size()).append('\n');
         for (Speaker speaker : speakers.values()) {
-            sb.append("  ").append(speaker.isConnected() ? "* " : "  ")
-              .append(speaker.getName()).append('\n');
+            sb.append("  ").append(speaker.isConnected() ? "* " : "  ").append(speaker.getName());
+            if (speaker.isConnected()) {
+                try {
+                    Volume volume = speaker.volume();
+                    VolumeRange range = volume.getVolumeRange();
+                    sb.append("  actual=").append(volume.getVolume())
+                      .append(" range=").append(range.getMin()).append("..").append(range.getMax())
+                      .append(" step=").append(range.getIncrement());
+                } catch (AllPlayException e) {
+                    sb.append("  (volume unreadable: ").append(e.getMessage()).append(')');
+                }
+            }
+            sb.append('\n');
         }
         return sb.toString();
     }

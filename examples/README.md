@@ -74,6 +74,7 @@ the only real volume control.
 curl http://<pi>:8080/status
 curl "http://<pi>:8080/volume?level=30"   # absolute, 0-100
 curl "http://<pi>:8080/volume?delta=-5"  # relative
+curl "http://<pi>:8080/band?ceiling=45"   # cap the usable band
 curl "http://<pi>:8080/mute?on=true"
 curl http://<pi>:8080/stop
 curl http://<pi>:8080/play
@@ -109,6 +110,8 @@ For unattended use the controller supervises its own state every `poll.seconds`:
 | `master.name` | *(first found)* | Which speaker leads the zone |
 | `volume` | `35` | Startup volume, 0-100 |
 | `control.port` | `8080` | HTTP control endpoint, `0` disables |
+| `volume.floor` | `0` | Bottom of the usable band, 0-100 |
+| `volume.ceiling` | `100` | Top of the usable band, 0-100 |
 | `discovery.seconds` | `25` | Initial discovery window |
 | `poll.seconds` | `12` | Supervision interval |
 | `org.alljoyn.bus.address` | `null:` | Router to use |
