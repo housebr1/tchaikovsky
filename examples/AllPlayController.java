@@ -24,6 +24,9 @@
  */
 import java.io.IOException;
 import java.io.OutputStream;
+import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.net.HttpURLConnection;
 import java.net.Inet4Address;
 import java.net.InetAddress;
@@ -42,6 +45,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.TimeUnit;
 
 import com.sun.net.httpserver.HttpExchange;
@@ -86,6 +90,7 @@ public class AllPlayController {
     /** Speakers report STOPPED briefly while they fetch and buffer the stream. */
     private volatile long playbackStartedAt = 0;
     private int notPlayingStreak = 0;
+    private final AtomicBoolean shuttingDown = new AtomicBoolean(false);
     /**
      * Usable slice of each speaker's range. The top of a speaker's range is
      * usually far louder than anyone wants indoors, which makes the whole slider
@@ -106,12 +111,7 @@ public class AllPlayController {
         log("stream url  = " + STREAM_URL);
 
         final AllPlayController controller = new AllPlayController();
-        Runtime.getRuntime().addShutdownHook(new Thread(new Runnable() {
-            public void run() {
-                controller.shutdown();
-            }
-        }, "allplay-shutdown"));
-
+        controller.installTerminationHandler();
         controller.run();
     }
 
@@ -555,26 +555,77 @@ public class AllPlayController {
     }
 
     /**
-     * Stop playback, then dissolve the zone, then drop the speakers, then the
-     * bus. Tearing down in that order keeps the router from logging a storm of
-     * failures about sessions that vanished underneath it.
+     * Cleans up on SIGTERM rather than from a JVM shutdown hook.
+     *
+     * alljoyn.jar registers its own shutdown hook inside BusAttachment.connect().
+     * JVM hooks run concurrently in no defined order, so cleanup registered as a
+     * hook races AllJoyn tearing the bus down underneath it: releaseZone() then
+     * fails with "Unable to create zone" and the speakers stay grouped, which is
+     * exactly what was observed. Handling the signal instead runs cleanup while
+     * the bus is still fully alive.
+     *
+     * halt() rather than exit() afterwards, because the work is already done and
+     * letting AllJoyn's hook run adds thousands of error lines about sessions
+     * that have gone away. The process is ending, so the OS reclaims the rest.
+     *
+     * sun.misc.Signal is reached reflectively so this still compiles with
+     * --release 8, and falls back to a plain hook if it is unavailable.
+     */
+    private void installTerminationHandler() {
+        try {
+            final Class<?> signalClass = Class.forName("sun.misc.Signal");
+            final Class<?> handlerClass = Class.forName("sun.misc.SignalHandler");
+            Object handler = Proxy.newProxyInstance(handlerClass.getClassLoader(),
+                    new Class<?>[] { handlerClass }, new InvocationHandler() {
+                        public Object invoke(Object proxy, Method method, Object[] args) {
+                            if ("handle".equals(method.getName())) {
+                                shutdown();
+                                Runtime.getRuntime().halt(0);
+                            }
+                            return null;
+                        }
+                    });
+            Object signal = signalClass.getConstructor(String.class).newInstance("TERM");
+            signalClass.getMethod("handle", signalClass, handlerClass)
+                    .invoke(null, signal, handler);
+            log("SIGTERM handler installed (cleanup runs before AllJoyn tears the bus down)");
+            return;
+        } catch (Throwable t) {
+            log("no SIGTERM handler available (" + t.getClass().getSimpleName()
+                    + "), falling back to a shutdown hook; zone release may race AllJoyn");
+        }
+        Runtime.getRuntime().addShutdownHook(new Thread(new Runnable() {
+            public void run() {
+                shutdown();
+            }
+        }, "allplay-shutdown"));
+    }
+
+    /**
+     * Dissolve the zone, then stop playback, then drop the speakers, then the
+     * bus. Both orders of the first two work against real speakers; releasing
+     * first means the speakers are ungrouped even if the stop call fails.
      */
     private void shutdown() {
+        if (!shuttingDown.compareAndSet(false, true)) {
+            return;
+        }
         log("shutting down");
         Speaker current = master;
+        try {
+            if (current != null && current.isConnected()) {
+                current.zoneManager().releaseZone();
+                log("zone released");
+            }
+        } catch (Exception e) {
+            log("could not release zone: " + e.getMessage());
+        }
         try {
             if (current != null && current.isConnected()) {
                 current.stop();
             }
         } catch (Exception e) {
             log("could not stop playback: " + e.getMessage());
-        }
-        try {
-            if (current != null && current.isConnected()) {
-                current.zoneManager().releaseZone();
-            }
-        } catch (Exception e) {
-            log("could not release zone: " + e.getMessage());
         }
         for (Speaker speaker : speakers.values()) {
             try {
