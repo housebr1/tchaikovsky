@@ -1,11 +1,18 @@
 /**
- * Groups every discovered AllPlay speaker into one zone and keeps it playing an
- * HTTP stream (for example an Icecast mount fed by librespot), then supervises
- * that state so it survives speaker reboots, network blips and stream outages.
+ * Plays an HTTP stream (for example an Icecast mount fed by librespot) on the
+ * AllPlay group that is already on the speakers, and supervises that playback
+ * so it survives speaker reboots, network blips and stream outages.
  *
  * Audio never flows through AllJoyn. The speakers pull the stream over plain
- * HTTP; this controller only tells them which URL to pull, keeps them grouped
- * so they stay in sync, and owns their volume.
+ * HTTP. This controller tells the group lead which URL to pull and owns volume
+ * for the rooms in that group. It does not keep rebuilding the group.
+ *
+ * The standalone AllPlay app is how rooms are chosen. Spotify cannot ask: it
+ * only plays, pauses, skips, seeks and sets volume. While a group exists, that
+ * group is followed and remembered. A group is formed here only when the
+ * speakers report none — the remembered rooms, or every room that is on if
+ * nothing has been remembered yet — and when {@code GET /group} asks for every
+ * room that is on. Shutdown leaves the group in place.
  *
  * Volume lives here because a librespot bridge running with
  * LIBRESPOT_VOLUME_CTRL=fixed always emits full-scale PCM, so the Spotify app's
@@ -14,7 +21,8 @@
  *
  * Configuration, all via system properties:
  *   -Dstream.url=http://host:8000/spotify.mp3   stream for the speakers to play
- *   -Dmaster.name=Kitchen                       which speaker leads the zone
+ *   -Dmaster.name=Kitchen                       preferred lead, and which group
+ *                                               to follow when several exist
  *   -Dvolume=35                                 startup volume, 0-100
  *   -Dcontrol.port=8080                         HTTP control endpoint, 0 disables
  *   -Ddiscovery.seconds=25                      initial discovery window
@@ -31,6 +39,7 @@ import java.io.OutputStream;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
+import java.io.UnsupportedEncodingException;
 import java.net.HttpURLConnection;
 import java.net.Inet4Address;
 import java.net.InetAddress;
@@ -39,11 +48,14 @@ import java.net.NetworkInterface;
 import java.net.SocketException;
 import java.net.URI;
 import java.net.URL;
+import java.net.URLDecoder;
+import java.net.URLEncoder;
 import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
@@ -70,6 +82,7 @@ import de.kaizencode.tchaikovsky.speaker.PlayState;
 import de.kaizencode.tchaikovsky.speaker.Speaker;
 import de.kaizencode.tchaikovsky.speaker.Volume;
 import de.kaizencode.tchaikovsky.speaker.VolumeRange;
+import de.kaizencode.tchaikovsky.speaker.ZoneInfo;
 import de.kaizencode.tchaikovsky.speaker.ZoneItem;
 
 public class AllPlayController {
@@ -96,7 +109,30 @@ public class AllPlayController {
     private volatile boolean streaming = false;
     private volatile int desiredVolume = Integer.getInteger("volume", 35);
     private volatile boolean muted = false;
-    private volatile Set<String> zonedIds = new HashSet<String>();
+    /**
+     * Rooms we currently drive. Volume and stop use this set only, so a room
+     * left out of the group is left alone. Replaced, never mutated in place.
+     */
+    private volatile Set<String> groupIds = Collections.emptySet();
+    /** Remembered rooms, in name order. Put back only when the speakers report no group. */
+    private volatile List<String> savedIds = Collections.emptyList();
+    private volatile List<String> savedNames = Collections.emptyList();
+    /**
+     * A smaller remembered set is written only after two scans agree. One empty
+     * zone read must not forget a room.
+     */
+    private List<String> pendingSavedIds;
+    private List<String> pendingSavedNames;
+    /** When we last formed a group. "No group" is ignored until that settles. */
+    private volatile long groupCreatedAt = 0;
+    /**
+     * Rebuilds while streaming. Reset when a group is actually visible, so a
+     * firmware that never reports a zone id cannot tear the audio down on every
+     * grace period. A later pause and play may form the group again.
+     */
+    private int restoreAttempts = 0;
+    /** Consecutive scans that saw no group. One empty read must not rebuild it. */
+    private int missingZoneStreak = 0;
     private volatile String lastError = "";
     private int consecutiveFailures = 0;
     /** Speakers report STOPPED briefly while they fetch and buffer the stream. */
@@ -182,7 +218,7 @@ public class AllPlayController {
         firstSpeaker.await(DISCOVERY_SECONDS, TimeUnit.SECONDS);
         Thread.sleep(TimeUnit.SECONDS.toMillis(DISCOVERY_SECONDS));
         log("discovery window closed with " + speakers.size()
-                + " speaker(s); late arrivals join on the next supervision pass");
+                + " speaker(s); a room that appears later is not added to an existing group");
 
         startControlServer();
 
@@ -224,34 +260,31 @@ public class AllPlayController {
         }
         if (!isStreamLive()) {
             if (streaming) {
-                log("stream went away, will regroup when it returns");
+                log("stream went away, will play again when it returns");
                 streaming = false;
             }
             return;
         }
         if (!streaming) {
-            // Prefer reopening the existing zone. startPlayback() always
-            // createZone()s, which is the audible tear-down pause/play was doing
-            // on every resume.
-            if (!reopenStream("supervise")) {
+            // Reopen when the lead is already there. Forming a group is the
+            // audible tear-down, so it happens only when there is no group and
+            // more remembered rooms are now on, or when reopen has no lead.
+            if (maybeMoreRooms() || !reopenStream("supervise")) {
                 startPlayback();
             }
-        } else if (!speakers.keySet().equals(zonedIds)) {
-            // Discovery is asynchronous and speakers appear well after the
-            // initial window, so regroup when the known set changes.
-            log("speaker set changed (" + zonedIds.size() + " -> " + speakers.size()
-                    + "), rebuilding zone");
-            startPlayback();
         } else {
+            // A new speaker must not rebuild the group. Follow a group the app
+            // changed; form one only if the speakers report that there isn't one.
+            trackGroup();
             verifyPlayback();
         }
     }
 
-    /** Restarts playback if the master is no longer actually playing. */
+    /** Restarts playback if the lead is no longer actually playing. */
     private void verifyPlayback() {
         Speaker current = master;
         if (current == null || !current.isConnected()) {
-            log("master is gone, regrouping");
+            log("lead is gone, will rejoin its group");
             streaming = false;
             return;
         }
@@ -267,102 +300,468 @@ public class AllPlayController {
                 notPlayingStreak = 0;
                 return;
             }
-            // Require two consecutive bad readings. Restarting on a single
-            // sample causes an audible glitch every time a speaker blips.
-            if (++notPlayingStreak < 2) {
-                log("master reported " + state + ", confirming on next pass");
+            // Four bad readings, not two. Two fired about a minute into a song
+            // that was actually playing (Blue Hawaii, watchdog at 61s, heard
+            // near 57s) and the reopen was the glitch. A real stall still
+            // reopens, just not on a pair of bad samples.
+            if (++notPlayingStreak < 4) {
+                log("lead reported " + state + " " + notPlayingStreak + "/4, "
+                        + ((System.currentTimeMillis() - playbackStartedAt) / 1000)
+                        + "s after playItem");
                 return;
             }
             notPlayingStreak = 0;
-            // Try re-opening the stream on the zone we already have before
-            // resorting to a rebuild. A lone STOPPED master is usually the
-            // speaker having dropped the HTTP body, and createZone() is the
-            // expensive, audible response - it regrouped twice in two minutes
-            // when a skip left the master briefly stopped.
+            // Re-open on the lead we already have. createZone() is the audible
+            // tear-down — it fired twice in two minutes when a skip left the lead
+            // briefly stopped — and a group that is still there must be kept.
             if (reopenStream("watchdog (" + state + ")")) {
                 return;
             }
             streaming = false;
         } catch (AllPlayException e) {
-            log("could not read play state (" + e.getMessage() + "), regrouping");
+            log("could not read play state (" + e.getMessage() + "), will rejoin the group");
             notPlayingStreak = 0;
             streaming = false;
         }
     }
 
-    /** Connects every speaker, groups them behind one master and starts the stream. */
-    private synchronized void startPlayback() throws AllPlayException {
-        if (speakers.isEmpty()) {
-            throw new IllegalStateException("no speakers discovered yet");
+    /**
+     * Adopts the group already on the speakers, or forms one when there isn't
+     * one. Forming uses the remembered rooms that are on, or every room that is
+     * on when nothing is remembered. {@code allOn} always forms that second
+     * group and replaces what was remembered. Returns null when nobody to play
+     * is on.
+     *
+     * The caller scans before taking the lock; see {@link #scanForGroup()}.
+     */
+    private synchronized Speaker ensureGroup(boolean allOn, Scan scan) throws AllPlayException {
+        if (!allOn && scan.zone != null) {
+            Speaker lead = scan.zoneLead;
+            if (lead == null || !lead.isConnected()) {
+                log("a group is on the speakers but its lead is not reachable; /group starts a new one");
+                throw new IllegalStateException("group lead is not reachable");
+            }
+            adoptZone(scan);
+            return lead;
         }
-        Speaker chosen = chooseMaster();
-        List<String> slaveIds = new ArrayList<String>();
-        Set<String> grouped = new HashSet<String>();
+        if (!allOn && !scan.readable && !scan.connected.isEmpty()) {
+            throw new IllegalStateException("could not read whether the speakers are grouped");
+        }
 
+        List<Speaker> targets = new ArrayList<Speaker>();
+        boolean fresh = allOn || savedIds.isEmpty();
+        if (fresh) {
+            targets.addAll(scan.connected);
+        } else {
+            List<String> wanted = savedIds;
+            for (Speaker speaker : scan.connected) {
+                if (wanted.contains(speaker.getId())) {
+                    targets.add(speaker);
+                }
+            }
+            if (targets.isEmpty()) {
+                log("remembered rooms are not on");
+                return null;
+            }
+        }
+        if (targets.isEmpty()) {
+            return null;
+        }
+
+        Speaker lead = chooseLead(targets);
+        // Already formed this exact set while streaming and the speakers still
+        // report no zone. Creating it again on the next poll tears the audio
+        // down. /group is an explicit request and still creates.
+        if (!allOn && restoreAttempts > 0 && sameSpeakers(groupIds, targets)
+                && master != null && lead.getId().equals(master.getId())) {
+            master = lead;
+            log("not forming the group again; /group does it if the rooms are apart");
+            return lead;
+        }
+        if (targets.size() > 1) {
+            List<String> slaves = new ArrayList<String>();
+            for (Speaker speaker : targets) {
+                if (!speaker.getId().equals(lead.getId())) {
+                    slaves.add(speaker.getId());
+                }
+            }
+            ZoneItem zone = lead.zoneManager().createZone(slaves);
+            groupCreatedAt = System.currentTimeMillis();
+            String why = allOn ? "all rooms that are on"
+                    : (fresh ? "no group yet, every room that is on" : "remembered rooms");
+            log("zone " + zone.getZoneId() + " lead=" + lead.getName()
+                    + " slaves=" + slaves.size() + " (" + why + ")");
+        } else {
+            log("one room on (" + lead.getName() + "), not creating a group");
+        }
+        restoreAttempts = 1;
+        missingZoneStreak = 0;
+        master = lead;
+        groupIds = idsOf(targets);
+        if (fresh) {
+            pendingSavedIds = null;
+            pendingSavedNames = null;
+            replaceSaved(targets);
+        }
+        applyVolume();
+        return lead;
+    }
+
+    /**
+     * While streaming, follow a group the app changed. Do not build one over a
+     * group that is still there.
+     *
+     * The scan talks to every speaker and can take tens of seconds. It must
+     * not hold the controller lock while it does: /skip's playItem waits on
+     * that lock, so a scan overlapping a track change reopened the stream
+     * half a minute into the new song (heard around 55s, after the speaker
+     * buffer). The lock is taken only to publish the result.
+     */
+    private void trackGroup() throws AllPlayException {
+        Scan scan = scanForGroup();
+        synchronized (this) {
+            trackGroupLocked(scan, scan.zoneLead);
+        }
+    }
+
+    /**
+     * Scan, and connect the zone's lead, without the controller lock. Every
+     * path that looks at the group does this first and locks only to act on
+     * the result. A room that refuses its session costs ~25s per connect()
+     * (16:34:59-16:35:25), and a scan under the lock held /resume long enough
+     * that the bridge's curl timed out (16:35:44).
+     */
+    private Scan scanForGroup() {
+        long started = System.currentTimeMillis();
+        Scan scan = scanSpeakers(true);
+        // connect() is AllJoyn too. Do it before taking the lock.
+        scan.zoneLead = scan.zone == null ? null : reachableLead(scan.zone);
+        long scanMs = System.currentTimeMillis() - started;
+        if (scanMs >= 1000) {
+            log("group scan took " + scanMs + "ms");
+        }
+        return scan;
+    }
+
+    private void trackGroupLocked(Scan scan, Speaker lead) throws AllPlayException {
+        if (scan.zone != null) {
+            if (lead == null) {
+                log("a group is on the speakers but its lead is not reachable");
+                return;
+            }
+            String previousLead = master == null ? "" : master.getId();
+            adoptZone(scan);
+            if (!lead.getId().equals(previousLead)) {
+                log("group lead is now " + lead.getName());
+                if (!reopenStream("group lead changed")) {
+                    playOn(lead);
+                }
+            }
+            return;
+        }
+        if (!scan.readable) {
+            return;
+        }
+        if (System.currentTimeMillis() - groupCreatedAt < TimeUnit.SECONDS.toMillis(GRACE_SECONDS)) {
+            return;
+        }
+        if (restoreAttempts > 0) {
+            return;
+        }
+        // Same rule as the playback watchdog: one empty reading is not enough.
+        // A group that is still there must not be rebuilt over a bad read.
+        if (++missingZoneStreak < 2) {
+            log("speakers report no group, confirming on the next pass");
+            return;
+        }
+        missingZoneStreak = 0;
+        log("speakers are not grouped, restoring remembered rooms");
+        startPlaybackLocked(scan);
+    }
+
+    private Speaker reachableLead(ZoneHit zone) {
+        Speaker lead = zone.lead;
+        if (lead == null) {
+            return null;
+        }
+        if (!lead.isConnected() && !connect(lead)) {
+            return null;
+        }
+        return lead.isConnected() ? lead : null;
+    }
+
+    /**
+     * True when more remembered rooms are connected than the live group has.
+     * Connected, not merely discovered: a room that is visible but refuses its
+     * session would otherwise send every resume through a full scan.
+     * Resume then looks at the speakers before reopening, so a room that came
+     * back while nothing was grouped can join at the start of play. A group
+     * that is already there is adopted instead, not rebuilt.
+     */
+    private boolean maybeMoreRooms() {
+        List<String> saved = savedIds;
+        Set<String> live = groupIds;
+        if (saved.size() <= live.size()) {
+            return false;
+        }
+        int present = 0;
         for (Speaker speaker : speakers.values()) {
-            if (!speaker.isConnected() && !connect(speaker)) {
+            if (speaker.isConnected() && saved.contains(speaker.getId())) {
+                present++;
+            }
+        }
+        return present > live.size();
+    }
+
+    /**
+     * Buckets speakers that share a zone id. With {@code reconnect}, first
+     * connects what we can see; without, reads only rooms already connected.
+     */
+    private Scan scanSpeakers(boolean reconnect) {
+        Scan scan = new Scan();
+        Map<String, ZoneHit> zones = new LinkedHashMap<String, ZoneHit>();
+        for (Speaker speaker : speakers.values()) {
+            if (!speaker.isConnected() && (!reconnect || !connect(speaker))) {
                 continue;
             }
-            grouped.add(speaker.getId());
-            if (!speaker.getId().equals(chosen.getId())) {
-                slaveIds.add(speaker.getId());
+            scan.connected.add(speaker);
+            ZoneInfo info;
+            try {
+                info = speaker.getPlayerInfo().getZoneInfo();
+            } catch (AllPlayException e) {
+                log("could not read group on " + speaker.getName() + ": " + e.getMessage());
+                continue;
+            }
+            if (info == null) {
+                continue;
+            }
+            scan.readable = true;
+            scan.readableSpeakers.add(speaker);
+            String zoneId = info.getZoneId();
+            if (zoneId == null || zoneId.trim().isEmpty()) {
+                continue;
+            }
+            ZoneHit zone = zones.get(zoneId);
+            if (zone == null) {
+                zone = new ZoneHit(zoneId);
+                zones.put(zoneId, zone);
+            }
+            zone.members.add(speaker);
+            zone.memberIds.add(speaker.getId());
+            if (info.isLeadPlayer()) {
+                zone.lead = speaker;
+            } else if (zone.lead == null) {
+                String leadId = info.getLeadPlayerID();
+                Speaker known = leadId == null ? null : speakers.get(leadId);
+                if (known != null) {
+                    zone.lead = known;
+                }
             }
         }
+        for (ZoneHit zone : zones.values()) {
+            if (zone.lead != null && zone.memberIds.add(zone.lead.getId())) {
+                zone.members.add(zone.lead);
+            }
+        }
+        scan.zone = pickZone(zones);
+        if (zones.size() > 1 && scan.zone != null) {
+            log(zones.size() + " groups on the speakers, following the one led by "
+                    + (scan.zone.lead == null ? scan.zone.zoneId : scan.zone.lead.getName()));
+        }
+        return scan;
+    }
 
-        if (!chosen.isConnected()) {
-            throw new IllegalStateException("master " + chosen.getName() + " is not connected");
+    /** Prefer -Dmaster.name, then the group we were already driving, then the largest. */
+    private ZoneHit pickZone(Map<String, ZoneHit> zones) {
+        ZoneHit best = null;
+        for (ZoneHit zone : zones.values()) {
+            if (best == null || preferZone(zone, best)) {
+                best = zone;
+            }
+        }
+        return best;
+    }
+
+    private boolean preferZone(ZoneHit candidate, ZoneHit current) {
+        if (!MASTER_NAME.isEmpty()) {
+            boolean candidateNamed = containsName(candidate, MASTER_NAME);
+            boolean currentNamed = containsName(current, MASTER_NAME);
+            if (candidateNamed != currentNamed) {
+                return candidateNamed;
+            }
+        }
+        Speaker currentLead = master;
+        if (currentLead != null) {
+            boolean candidateHas = candidate.memberIds.contains(currentLead.getId());
+            boolean currentHas = current.memberIds.contains(currentLead.getId());
+            if (candidateHas != currentHas) {
+                return candidateHas;
+            }
+        }
+        if (candidate.members.size() != current.members.size()) {
+            return candidate.members.size() > current.members.size();
+        }
+        return candidate.zoneId.compareTo(current.zoneId) < 0;
+    }
+
+    private static boolean containsName(ZoneHit zone, String name) {
+        for (Speaker speaker : zone.members) {
+            if (name.equalsIgnoreCase(speaker.getName())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The speakers' group wins over memory. Rooms we could not read stay
+     * remembered. A room we could read outside this group is forgotten only
+     * after a second scan says the same, so one empty read does not drop it.
+     *
+     * @return true when the live lead or the live members changed
+     */
+    private boolean adoptZone(Scan scan) {
+        ZoneHit zone = scan.zone;
+        if (zone == null || zone.lead == null) {
+            return false;
+        }
+        restoreAttempts = 0;
+        missingZoneStreak = 0;
+        String previousLead = master == null ? "" : master.getId();
+        Set<String> previousIds = groupIds;
+        master = zone.lead;
+        groupIds = new HashSet<String>(zone.memberIds);
+
+        LinkedHashMap<String, String> proposed = new LinkedHashMap<String, String>();
+        List<String> previousSaved = savedIds;
+        List<String> previousNames = savedNames;
+        for (int i = 0; i < previousSaved.size() && i < previousNames.size(); i++) {
+            proposed.put(previousSaved.get(i), previousNames.get(i));
+        }
+        for (Speaker speaker : scan.readableSpeakers) {
+            if (!zone.memberIds.contains(speaker.getId())) {
+                proposed.remove(speaker.getId());
+            }
+        }
+        for (Speaker member : zone.members) {
+            proposed.put(member.getId(), member.getName());
+        }
+        List<String> proposedIds = new ArrayList<String>(proposed.keySet());
+        List<String> proposedNames = new ArrayList<String>(proposed.values());
+        sortByName(proposedIds, proposedNames);
+
+        if (sameIds(proposedIds, previousSaved)) {
+            pendingSavedIds = null;
+            pendingSavedNames = null;
+            if (!proposedNames.equals(previousNames)) {
+                savedIds = proposedIds;
+                savedNames = proposedNames;
+                saveState();
+            }
+        } else if (properSubset(proposedIds, previousSaved)) {
+            if (pendingSavedIds != null && sameIds(pendingSavedIds, proposedIds)) {
+                pendingSavedIds = null;
+                pendingSavedNames = null;
+                savedIds = proposedIds;
+                savedNames = proposedNames;
+                saveState();
+                log("remembering smaller group " + joinList(proposedNames));
+            } else {
+                pendingSavedIds = proposedIds;
+                pendingSavedNames = proposedNames;
+                log("group looks smaller (" + joinList(proposedNames)
+                        + "); confirming before forgetting the other rooms");
+            }
+        } else {
+            pendingSavedIds = null;
+            pendingSavedNames = null;
+            savedIds = proposedIds;
+            savedNames = proposedNames;
+            saveState();
+            log("remembering " + joinList(proposedNames));
         }
 
-        // createZone() runs on the master and takes the slaves. Without a zone
-        // each speaker pulls the stream independently and the rooms drift apart.
-        ZoneItem zone = chosen.zoneManager().createZone(slaveIds);
-        master = chosen;
-        log("zone " + zone.getZoneId() + " master=" + chosen.getName()
-                + " slaves=" + slaveIds.size());
-
-        chosen.playItem(liveStreamUrl());
-        // Record every speaker considered, not just those that grouped. A
-        // speaker that is discoverable but refuses to join a session (seen as
-        // ALLJOYN_JOINSESSION_REPLY_FAILED) would otherwise keep the known set
-        // permanently larger than the zoned set, so the membership check would
-        // rebuild the zone on every pass - tearing playback down and back up
-        // every poll.seconds indefinitely. A genuinely new speaker still
-        // changes this set and triggers a regroup.
-        zonedIds = new HashSet<String>(speakers.keySet());
-        if (grouped.size() < speakers.size()) {
-            log("grouped " + grouped.size() + " of " + speakers.size()
-                    + " speaker(s); the others are retried when the set changes");
+        boolean changed = !zone.lead.getId().equals(previousLead) || !groupIds.equals(previousIds);
+        if (changed) {
+            log("following " + joinNames(groupIds) + ", lead " + zone.lead.getName());
+            applyVolume();
         }
+        return changed;
+    }
+
+    /** Starts the stream on the lead of {@link #ensureGroup(boolean, Scan) ensureGroup(false, scan)}. */
+    private void startPlayback() throws AllPlayException {
+        Scan scan = scanForGroup();
+        synchronized (this) {
+            startPlaybackLocked(scan);
+        }
+    }
+
+    private synchronized void startPlaybackLocked(Scan scan) throws AllPlayException {
+        Speaker lead = ensureGroup(false, scan);
+        if (lead == null) {
+            if (speakers.isEmpty()) {
+                throw new IllegalStateException("no speakers discovered yet");
+            }
+            throw new IllegalStateException("remembered rooms are not on");
+        }
+        playOn(lead);
+        log("playing " + STREAM_URL + " on " + joinNames(groupIds) + " at volume "
+                + desiredVolume + (muted ? " (muted)" : ""));
+    }
+
+    private void playOn(Speaker lead) throws AllPlayException {
+        lead.playItem(liveStreamUrl());
         streaming = true;
         playbackStartedAt = System.currentTimeMillis();
         lastResumeAt = playbackStartedAt;
         notPlayingStreak = 0;
         applyVolume();
-        log("playing " + STREAM_URL + " on " + grouped.size() + " speaker(s) at volume "
-                + desiredVolume + (muted ? " (muted)" : ""));
+    }
+
+    /** Every room that is on, replacing the remembered group. Does not start playback while paused. */
+    private String groupAllOn() throws AllPlayException {
+        Scan scan = scanForGroup();
+        boolean live = isStreamLive();
+        synchronized (this) {
+            return groupAllOnLocked(scan, live);
+        }
+    }
+
+    private String groupAllOnLocked(Scan scan, boolean live) throws AllPlayException {
+        Speaker lead = ensureGroup(true, scan);
+        if (lead == null) {
+            return "no speakers on\n";
+        }
+        String names = joinNames(groupIds);
+        if (sourcePaused || !live) {
+            log("grouped every room that is on (" + names + "), not playing yet");
+            return "grouped " + names + "\n";
+        }
+        playOn(lead);
+        log("grouped every room that is on (" + names + ") and started the stream");
+        return "grouped " + names + "\n";
     }
 
     /**
-     * Pushes the desired volume to every connected speaker, scaled into each
-     * one's own range. Speakers are set individually rather than through the
-     * zone master so the rooms match instead of inheriting whatever level each
-     * was last left at physically.
-     */
-    /**
-     * Remembers volume, mute and band across restarts.
+     * Remembers volume, mute, band and the group across restarts.
      *
      * Without this every restart resets to the -Dvolume default and throws away
      * where the Spotify slider actually is. librespot only emits volume_changed
      * when the slider moves, so nothing corrects it until someone happens to
      * touch it - which presents as the speakers being inaudible after a reboot.
      */
-    private void saveState() {
+    private synchronized void saveState() {
         try {
             Properties props = new Properties();
             props.setProperty("volume", Integer.toString(desiredVolume));
             props.setProperty("muted", Boolean.toString(muted));
             props.setProperty("volume.floor", Integer.toString(volumeFloor));
             props.setProperty("volume.ceiling", Integer.toString(volumeCeiling));
+            String group = encodeGroup();
+            if (!group.isEmpty()) {
+                props.setProperty("group", group);
+            }
             OutputStream out = new FileOutputStream(STATE_FILE);
             try {
                 props.store(out, "AllPlayController state; safe to delete");
@@ -392,16 +791,26 @@ public class AllPlayController {
             muted = Boolean.parseBoolean(props.getProperty("muted", Boolean.toString(muted)));
             volumeFloor = Integer.parseInt(props.getProperty("volume.floor", Integer.toString(volumeFloor)));
             volumeCeiling = Integer.parseInt(props.getProperty("volume.ceiling", Integer.toString(volumeCeiling)));
+            decodeGroup(props.getProperty("group", ""));
+            String rooms = joinList(savedNames);
             log("restored volume " + desiredVolume + (muted ? " (muted)" : "")
-                    + ", band " + volumeFloor + "-" + volumeCeiling);
+                    + ", band " + volumeFloor + "-" + volumeCeiling
+                    + (rooms.isEmpty() ? "" : ", rooms " + rooms));
         } catch (Exception e) {
             log("could not read state from " + STATE_FILE + " (" + e.getMessage() + "), using defaults");
         }
     }
 
+    /**
+     * Pushes the desired volume to each speaker in the current group, scaled
+     * into that speaker's own range. Rooms left out of the group are not
+     * touched. Members are set individually rather than through the lead, so
+     * the rooms match instead of keeping whatever level each was last left at.
+     */
     private void applyVolume() {
+        Set<String> ids = groupIds;
         for (Speaker speaker : speakers.values()) {
-            if (!speaker.isConnected()) {
+            if (!speaker.isConnected() || !ids.contains(speaker.getId())) {
                 continue;
             }
             try {
@@ -439,11 +848,18 @@ public class AllPlayController {
     private boolean connect(Speaker speaker) {
         try {
             speaker.connect();
+            final Speaker watched = speaker;
             speaker.addSpeakerConnectionListener(new SpeakerConnectionListener() {
                 public void onConnectionLost(String hostName, int reason) {
-                    log("connection lost to " + hostName + " (reason " + reason
-                            + "), will regroup");
-                    streaming = false;
+                    Speaker lead = master;
+                    if (lead != null && lead.getId().equals(watched.getId())) {
+                        log("lead " + watched.getName() + " connection lost (reason " + reason
+                                + "), will rejoin its group");
+                        streaming = false;
+                    } else {
+                        log("connection lost to " + watched.getName() + " (reason " + reason
+                                + "), group left as it is");
+                    }
                 }
             });
             return true;
@@ -453,16 +869,24 @@ public class AllPlayController {
         }
     }
 
-    /** Prefers -Dmaster.name when it matches, otherwise any discovered speaker. */
-    private Speaker chooseMaster() {
+    /** Preferred lead when this controller has to form a group: -Dmaster.name, else the current lead. */
+    private Speaker chooseLead(List<Speaker> candidates) {
         if (!MASTER_NAME.isEmpty()) {
-            for (Speaker speaker : speakers.values()) {
+            for (Speaker speaker : candidates) {
                 if (MASTER_NAME.equalsIgnoreCase(speaker.getName())) {
                     return speaker;
                 }
             }
         }
-        return speakers.values().iterator().next();
+        Speaker current = master;
+        if (current != null) {
+            for (Speaker speaker : candidates) {
+                if (current.getId().equals(speaker.getId())) {
+                    return speaker;
+                }
+            }
+        }
+        return candidates.get(0);
     }
 
     private void connectBus() throws Exception {
@@ -492,9 +916,12 @@ public class AllPlayController {
             log("ignoring error while dropping old bus: " + e.getMessage());
         }
         speakers.clear();
-        zonedIds = new HashSet<String>();
+        groupIds = Collections.emptySet();
         master = null;
         streaming = false;
+        restoreAttempts = 0;
+        missingZoneStreak = 0;
+        groupCreatedAt = 0;
         connectBus();
         log("bus reconnected, rediscovering speakers");
     }
@@ -535,6 +962,15 @@ public class AllPlayController {
         if (!stillThisPause(epoch)) {
             return;
         }
+        try {
+            refreshGroupBeforePause();
+        } catch (Exception e) {
+            log("could not read the group before pause (" + e.getMessage()
+                    + "), stopping the last known rooms");
+        }
+        if (!stillThisPause(epoch)) {
+            return;
+        }
         int stopped = stopSpeakersParallel(epoch);
         synchronized (this) {
             if (!stillThisPause(epoch)) {
@@ -548,17 +984,59 @@ public class AllPlayController {
     }
 
     /**
-     * stop() every connected speaker at once. Sequential stops took several
-     * seconds per room, so a 4-10s pause/play always landed inside stop()
-     * (and a hung AllJoyn call at 18:00 left paused=true with streaming=true).
+     * Pause has to hit the group the app left in place, which may have changed
+     * since the last poll. Look first; do not form a group from here.
+     *
+     * Read only rooms already connected, and outside the lock. A resume right
+     * after the pause needs the lock, and must not wait on reconnect attempts.
+     */
+    private void refreshGroupBeforePause() throws AllPlayException {
+        if (speakers.isEmpty()) {
+            return;
+        }
+        Scan scan = scanSpeakers(false);
+        Speaker lead = scan.zone == null ? null : scan.zone.lead;
+        if (lead == null || !lead.isConnected()) {
+            return;
+        }
+        synchronized (this) {
+            adoptZone(scan);
+        }
+    }
+
+    /**
+     * stop() every speaker in the current group at once. Rooms left out are
+     * not stopped. Sequential stops took several seconds per room, so a short
+     * pause/play always landed inside stop() (and a hung AllJoyn call at 18:00
+     * left paused=true with streaming=true).
      */
     private int stopSpeakersParallel(final int epoch) {
+        return stopSpeakers(groupedTargets(), true, epoch);
+    }
+
+    /** Stop the current group. Used by /stop and shutdown; pause has its own epoch. */
+    private int stopGrouped() {
+        return stopSpeakers(groupedTargets(), false, 0);
+    }
+
+    private List<Speaker> groupedTargets() {
         List<Speaker> targets = new ArrayList<Speaker>();
+        Set<String> ids = groupIds;
         for (Speaker speaker : speakers.values()) {
-            if (speaker.isConnected()) {
+            if (speaker.isConnected() && ids.contains(speaker.getId())) {
                 targets.add(speaker);
             }
         }
+        if (targets.isEmpty() && ids.isEmpty()) {
+            Speaker current = master;
+            if (current != null && current.isConnected()) {
+                targets.add(current);
+            }
+        }
+        return targets;
+    }
+
+    private int stopSpeakers(final List<Speaker> targets, final boolean onlyIfPaused, final int epoch) {
         if (targets.isEmpty()) {
             return 0;
         }
@@ -567,7 +1045,7 @@ public class AllPlayController {
         for (final Speaker speaker : targets) {
             Thread thread = new Thread(new Runnable() {
                 public void run() {
-                    if (!stillThisPause(epoch)) {
+                    if (onlyIfPaused && !stillThisPause(epoch)) {
                         return;
                     }
                     try {
@@ -576,7 +1054,7 @@ public class AllPlayController {
                     } catch (Exception e) {
                         log("could not stop " + speaker.getName() + ": " + e.getMessage());
                     }
-                    if (!stillThisPause(epoch) && !sourcePaused) {
+                    if (onlyIfPaused && !stillThisPause(epoch) && !sourcePaused) {
                         reopenStream("late stop after resume", true);
                     }
                 }
@@ -606,8 +1084,8 @@ public class AllPlayController {
             }
         }
         if (alive > 0) {
-            log("pause: " + alive + " speaker stop(s) still running after "
-                    + STOP_JOIN_MS + "ms, continuing");
+            log((onlyIfPaused ? "pause: " : "stop: ") + alive
+                    + " speaker stop(s) still running after " + STOP_JOIN_MS + "ms, continuing");
         }
         return stopped.get();
     }
@@ -632,32 +1110,50 @@ public class AllPlayController {
      * Skip, resume and the watchdog all need this: createZone() is what made
      * pause/play mint a new zone id every time (~17:11-17:12).
      */
-    private synchronized boolean reopenStream(String reason) {
+    private boolean reopenStream(String reason) {
         return reopenStream(reason, false);
     }
 
-    private synchronized boolean reopenStream(String reason, boolean coalesce) {
-        Speaker current = master;
-        if (current == null || !current.isConnected()) {
-            return false;
-        }
-        long now = System.currentTimeMillis();
-        if (coalesce && streaming && now - lastReopenAt < REOPEN_COALESCE_MS) {
-            log(reason + ": coalesced reopen on " + current.getName());
-            return true;
-        }
-        try {
-            current.playItem(liveStreamUrl());
-            lastReopenAt = now;
-            streaming = true;
-            playbackStartedAt = System.currentTimeMillis();
-            notPlayingStreak = 0;
-            log(reason + ": reopened stream on " + current.getName() + " (zone kept)");
-            return true;
-        } catch (Exception e) {
-            log(reason + " reopen failed (" + e.getMessage() + ")");
-            streaming = false;
-            return false;
+    /**
+     * The wait is how long this reopen sat behind another controller operation
+     * (usually the group scan). playItem is how long the speaker call itself
+     * took. A wait of many seconds is a mid-song hole: the reopen lands late.
+     */
+    private boolean reopenStream(String reason, boolean coalesce) {
+        long requested = System.currentTimeMillis();
+        synchronized (this) {
+            long waited = System.currentTimeMillis() - requested;
+            Speaker current = master;
+            if (current == null || !current.isConnected()) {
+                if (waited >= 200) {
+                    log(reason + ": reopen gave up after waiting " + waited + "ms, lead gone");
+                }
+                return false;
+            }
+            long now = System.currentTimeMillis();
+            if (coalesce && streaming && now - lastReopenAt < REOPEN_COALESCE_MS) {
+                log(reason + ": coalesced reopen on " + current.getName()
+                        + " (waited " + waited + "ms)");
+                return true;
+            }
+            long call = System.currentTimeMillis();
+            try {
+                current.playItem(liveStreamUrl());
+                long took = System.currentTimeMillis() - call;
+                lastReopenAt = now;
+                streaming = true;
+                playbackStartedAt = System.currentTimeMillis();
+                notPlayingStreak = 0;
+                log(reason + ": reopened stream on " + current.getName()
+                        + " (zone kept, waited " + waited + "ms, playItem " + took + "ms)");
+                return true;
+            } catch (Exception e) {
+                long took = System.currentTimeMillis() - call;
+                log(reason + " reopen failed after " + took + "ms, waited " + waited
+                        + "ms (" + e.getMessage() + ")");
+                streaming = false;
+                return false;
+            }
         }
     }
 
@@ -684,7 +1180,9 @@ public class AllPlayController {
         if (streaming) {
             return "resumed\n";
         }
-        if (reopenStream(reason)) {
+        // A group that is already there is reopened, not rebuilt. Look again
+        // only when more remembered rooms have shown up than the live group has.
+        if (!maybeMoreRooms() && reopenStream(reason)) {
             return "resumed\n";
         }
         resumeNow();
@@ -709,7 +1207,7 @@ public class AllPlayController {
                     }
                     try {
                         if (isStreamLive()) {
-                            if (!reopenStream("resume")) {
+                            if (maybeMoreRooms() || !reopenStream("resume")) {
                                 startPlayback();
                             }
                             return;
@@ -733,15 +1231,48 @@ public class AllPlayController {
         thread.start();
     }
 
-    /** Icecast returns 404 on the mount until a source connects to it. */
+    /**
+     * True when Icecast has a source on this mount.
+     *
+     * Do not GET the audio mount to find out. That request joins as another
+     * listener, and with burst-size 0 Icecast then glitches the speaker that is
+     * already playing. Seen every poll: listener count 1, then 2, then 1, client
+     * Java, about 1.6 KB, and a short silence in the song. status-json is an
+     * ordinary short document and does not attach to the stream.
+     */
     private boolean isStreamLive() {
         HttpURLConnection connection = null;
         try {
-            connection = (HttpURLConnection) new URL(STREAM_URL).openConnection();
-            connection.setRequestMethod("GET");
-            connection.setConnectTimeout(5000);
-            connection.setReadTimeout(5000);
-            return connection.getResponseCode() == 200;
+            URL stream = new URL(STREAM_URL);
+            int port = stream.getPort();
+            if (port < 0) {
+                port = stream.getDefaultPort();
+            }
+            String mount = stream.getPath();
+            if (mount == null || mount.isEmpty()) {
+                return false;
+            }
+            URL stats = new URL("http", "127.0.0.1", port, "/status-json.xsl");
+            connection = (HttpURLConnection) stats.openConnection();
+            connection.setConnectTimeout(2000);
+            connection.setReadTimeout(2000);
+            if (connection.getResponseCode() != 200) {
+                return false;
+            }
+            InputStream in = connection.getInputStream();
+            try {
+                byte[] buf = new byte[4096];
+                StringBuilder body = new StringBuilder();
+                int total = 0;
+                int n;
+                while ((n = in.read(buf)) != -1 && total < 65536) {
+                    body.append(new String(buf, 0, n, UTF8));
+                    total += n;
+                }
+                return body.indexOf(mount) >= 0;
+            } finally {
+                in.close();
+            }
         } catch (IOException e) {
             return false;
         } finally {
@@ -782,7 +1313,7 @@ public class AllPlayController {
             server.setExecutor(null);
             server.start();
             log("control endpoint on http://0.0.0.0:" + CONTROL_PORT
-                    + "  (/status /volume /band /mute /pause /resume /skip /seek /play /stop)");
+                    + "  (/status /volume /band /mute /pause /resume /skip /seek /play /stop /group)");
         } catch (IOException e) {
             log("could not start control endpoint: " + e.getMessage());
         }
@@ -879,11 +1410,12 @@ public class AllPlayController {
         if (path.startsWith("/play")) {
             return resumeFromSource("play");
         }
+        // Every room that is currently on. Not something Spotify can ask for.
+        if (path.startsWith("/group")) {
+            return groupAllOn();
+        }
         if (path.startsWith("/stop")) {
-            Speaker current = master;
-            if (current != null && current.isConnected()) {
-                current.stop();
-            }
+            stopGrouped();
             streaming = false;
             return "stopped\n";
         }
@@ -897,7 +1429,22 @@ public class AllPlayController {
         sb.append("live      ").append(isStreamLive()).append('\n');
         sb.append("streaming ").append(streaming).append('\n');
         sb.append("paused    ").append(sourcePaused).append(" (reported by source)\n");
-        sb.append("master    ").append(current == null ? "-" : current.getName()).append('\n');
+        sb.append("lead      ").append(current == null ? "-" : current.getName()).append('\n');
+        if (groupIds.isEmpty()) {
+            String remembered = joinList(savedNames);
+            sb.append("group     ").append(remembered.isEmpty()
+                    ? "- (playback groups every room that is on)"
+                    : "- (remembered " + remembered + ")").append('\n');
+        } else {
+            sb.append("group     ").append(joinNames(groupIds)).append('\n');
+        }
+        String leftOut = leftOutNames();
+        sb.append("left out  ").append(leftOut.isEmpty() ? "-" : leftOut).append('\n');
+        String off = rememberedOffNames();
+        if (!off.isEmpty()) {
+            sb.append("off       ").append(off).append('\n');
+        }
+        sb.append("all rooms GET /group\n");
         sb.append("volume    ").append(desiredVolume).append(muted ? " (muted)" : "").append('\n');
         sb.append("failures  ").append(consecutiveFailures).append('\n');
         if (!lastError.isEmpty()) {
@@ -908,6 +1455,11 @@ public class AllPlayController {
         sb.append("speakers  ").append(speakers.size()).append('\n');
         for (Speaker speaker : speakers.values()) {
             sb.append("  ").append(speaker.isConnected() ? "* " : "  ").append(speaker.getName());
+            if (current != null && current.getId().equals(speaker.getId())) {
+                sb.append(" (lead)");
+            } else if (!groupIds.isEmpty() && !groupIds.contains(speaker.getId())) {
+                sb.append(" (not in group)");
+            }
             if (speaker.isConnected()) {
                 try {
                     Volume volume = speaker.volume();
@@ -988,10 +1540,10 @@ public class AllPlayController {
      *
      * alljoyn.jar registers its own shutdown hook inside BusAttachment.connect().
      * JVM hooks run concurrently in no defined order, so cleanup registered as a
-     * hook races AllJoyn tearing the bus down underneath it: releaseZone() then
-     * fails with "Unable to create zone" and the speakers stay grouped, which is
-     * exactly what was observed. Handling the signal instead runs cleanup while
-     * the bus is still fully alive.
+     * hook races AllJoyn tearing the bus down underneath it. Handling the signal
+     * instead runs cleanup while the bus is still fully alive. The group is
+     * left in place: releaseZone() is what would dissolve the rooms chosen in
+     * the standalone app, and a restart must not do that.
      *
      * halt() rather than exit() afterwards, because the work is already done and
      * letting AllJoyn's hook run adds thousands of error lines about sessions
@@ -1021,7 +1573,7 @@ public class AllPlayController {
             return;
         } catch (Throwable t) {
             log("no SIGTERM handler available (" + t.getClass().getSimpleName()
-                    + "), falling back to a shutdown hook; zone release may race AllJoyn");
+                    + "), falling back to a shutdown hook; stop may race AllJoyn");
         }
         Runtime.getRuntime().addShutdownHook(new Thread(new Runnable() {
             public void run() {
@@ -1031,28 +1583,17 @@ public class AllPlayController {
     }
 
     /**
-     * Dissolve the zone, then stop playback, then drop the speakers, then the
-     * bus. Both orders of the first two work against real speakers; releasing
-     * first means the speakers are ungrouped even if the stop call fails.
+     * Stop playback, then drop the speakers, then the bus. The group is not
+     * released: the rooms chosen in the app have to still be grouped after a
+     * restart. Stop only the rooms in the group.
      */
     private void shutdown() {
         if (!shuttingDown.compareAndSet(false, true)) {
             return;
         }
-        log("shutting down");
-        Speaker current = master;
+        log("shutting down, leaving the speaker group in place");
         try {
-            if (current != null && current.isConnected()) {
-                current.zoneManager().releaseZone();
-                log("zone released");
-            }
-        } catch (Exception e) {
-            log("could not release zone: " + e.getMessage());
-        }
-        try {
-            if (current != null && current.isConnected()) {
-                current.stop();
-            }
+            stopGrouped();
         } catch (Exception e) {
             log("could not stop playback: " + e.getMessage());
         }
@@ -1072,6 +1613,179 @@ public class AllPlayController {
                 log("could not disconnect bus: " + e.getMessage());
             }
         }
+    }
+
+    private void replaceSaved(List<Speaker> members) {
+        List<String> ids = new ArrayList<String>();
+        List<String> names = new ArrayList<String>();
+        for (Speaker speaker : members) {
+            ids.add(speaker.getId());
+            names.add(speaker.getName());
+        }
+        sortByName(ids, names);
+        savedIds = ids;
+        savedNames = names;
+        saveState();
+    }
+
+    private static Set<String> idsOf(List<Speaker> members) {
+        Set<String> ids = new HashSet<String>();
+        for (Speaker speaker : members) {
+            ids.add(speaker.getId());
+        }
+        return ids;
+    }
+
+    private static boolean sameSpeakers(Set<String> ids, List<Speaker> members) {
+        if (ids.size() != members.size()) {
+            return false;
+        }
+        for (Speaker speaker : members) {
+            if (!ids.contains(speaker.getId())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean sameIds(List<String> left, List<String> right) {
+        if (left.size() != right.size()) {
+            return false;
+        }
+        return new HashSet<String>(left).equals(new HashSet<String>(right));
+    }
+
+    private static boolean properSubset(List<String> smaller, List<String> larger) {
+        if (smaller.size() >= larger.size()) {
+            return false;
+        }
+        return new HashSet<String>(larger).containsAll(smaller);
+    }
+
+    private static void sortByName(List<String> ids, List<String> names) {
+        for (int i = 0; i < names.size(); i++) {
+            for (int j = i + 1; j < names.size(); j++) {
+                if (names.get(j).compareToIgnoreCase(names.get(i)) < 0) {
+                    Collections.swap(names, i, j);
+                    Collections.swap(ids, i, j);
+                }
+            }
+        }
+    }
+
+    private String joinNames(Set<String> ids) {
+        List<String> names = new ArrayList<String>();
+        for (Speaker speaker : speakers.values()) {
+            if (ids.contains(speaker.getId())) {
+                names.add(speaker.getName());
+            }
+        }
+        Collections.sort(names, String.CASE_INSENSITIVE_ORDER);
+        return joinList(names);
+    }
+
+    private String leftOutNames() {
+        Set<String> ids = groupIds;
+        if (ids.isEmpty()) {
+            return "";
+        }
+        List<String> names = new ArrayList<String>();
+        for (Speaker speaker : speakers.values()) {
+            if (!ids.contains(speaker.getId())) {
+                names.add(speaker.getName());
+            }
+        }
+        Collections.sort(names, String.CASE_INSENSITIVE_ORDER);
+        return joinList(names);
+    }
+
+    private String rememberedOffNames() {
+        List<String> names = new ArrayList<String>();
+        List<String> ids = savedIds;
+        List<String> saved = savedNames;
+        for (int i = 0; i < ids.size() && i < saved.size(); i++) {
+            if (!speakers.containsKey(ids.get(i))) {
+                names.add(saved.get(i));
+            }
+        }
+        Collections.sort(names, String.CASE_INSENSITIVE_ORDER);
+        return joinList(names);
+    }
+
+    private static String joinList(List<String> names) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < names.size(); i++) {
+            if (i > 0) {
+                sb.append(", ");
+            }
+            sb.append(names.get(i));
+        }
+        return sb.toString();
+    }
+
+    private String encodeGroup() {
+        StringBuilder sb = new StringBuilder();
+        List<String> ids = savedIds;
+        List<String> names = savedNames;
+        int count = Math.min(ids.size(), names.size());
+        for (int i = 0; i < count; i++) {
+            if (sb.length() > 0) {
+                sb.append(',');
+            }
+            sb.append(urlEncode(ids.get(i))).append('=').append(urlEncode(names.get(i)));
+        }
+        return sb.toString();
+    }
+
+    private void decodeGroup(String raw) {
+        if (raw == null || raw.trim().isEmpty()) {
+            return;
+        }
+        List<String> ids = new ArrayList<String>();
+        List<String> names = new ArrayList<String>();
+        String[] tokens = raw.split(",");
+        for (int i = 0; i < tokens.length; i++) {
+            int eq = tokens[i].indexOf('=');
+            if (eq <= 0) {
+                continue;
+            }
+            try {
+                ids.add(URLDecoder.decode(tokens[i].substring(0, eq), "UTF-8"));
+                names.add(URLDecoder.decode(tokens[i].substring(eq + 1), "UTF-8"));
+            } catch (UnsupportedEncodingException e) {
+                log("ignoring unreadable remembered room");
+            }
+        }
+        savedIds = ids;
+        savedNames = names;
+    }
+
+    private static String urlEncode(String raw) {
+        try {
+            return URLEncoder.encode(raw, "UTF-8");
+        } catch (UnsupportedEncodingException e) {
+            return raw;
+        }
+    }
+
+    private static final class ZoneHit {
+        final String zoneId;
+        Speaker lead;
+        final List<Speaker> members = new ArrayList<Speaker>();
+        final Set<String> memberIds = new HashSet<String>();
+
+        ZoneHit(String zoneId) {
+            this.zoneId = zoneId;
+        }
+    }
+
+    private static final class Scan {
+        ZoneHit zone;
+        /** zone.lead once connected, else null. Set by {@link #scanForGroup()}. */
+        Speaker zoneLead;
+        boolean readable;
+        final List<Speaker> connected = new ArrayList<Speaker>();
+        final List<Speaker> readableSpeakers = new ArrayList<Speaker>();
     }
 
     private static void log(String message) {

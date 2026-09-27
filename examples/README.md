@@ -1,8 +1,8 @@
 # AllPlay zone controller
 
-`AllPlayController.java` groups every discovered AllPlay speaker into a single
-zone and keeps it playing an HTTP stream — for example an Icecast mount fed by
-librespot/raspotify.
+`AllPlayController.java` plays an HTTP stream on the AllPlay group that is
+already on the speakers — for example an Icecast mount fed by librespot/raspotify.
+The standalone AllPlay app chooses the rooms. This controller follows that group.
 
 ## How the pieces fit
 
@@ -17,25 +17,38 @@ Spotify ──► librespot ──► FIFO ──► ffmpeg (MP3) ──► Icec
             AllPlayController ──────────────────►  tells them which URL to pull
 ```
 
-The controller's whole job is `speaker.playItem(url)` plus keeping the speakers
-grouped.
+The controller's whole job is `playItem(url)` on the group lead, plus volume for
+the rooms in that group.
 
 ## Why a zone
 
 Without one, each speaker pulls the stream independently, buffers on its own
-schedule and drifts — you get echo between rooms. `createZone()` is called on
-the master with the other speakers as slaves, so AllPlay keeps them in sync.
+schedule and drifts — you get echo between rooms. The AllPlay app creates the
+zone. This controller creates one only when the speakers report that there isn't
+one: the rooms it remembers, or every room that is on if nothing is remembered
+yet. `GET /group` does that second thing on purpose and remembers the result.
+
+Spotify cannot ask for this. The Spotify app only plays, pauses, skips, seeks
+and sets volume, and those already reach the speakers. To put every room that
+is on into the group, open `http://<pi>:8080/group` (a home-screen bookmark is
+the practical button). A room that is switched off at that moment is not
+included.
+
+Leaving rooms out is done in the AllPlay app. The controller notices, remembers
+the smaller set, and does not put the others back on the next track. Pause,
+skip and seek keep the group. Restarting the controller does not dissolve it.
+A speaker that appears after the group exists is not pulled in; add it from the
+app, or ask for all rooms that are on again.
 
 ## Why it waits for the stream
 
-An Icecast mount returns 404 until a source connects, so it is dead whenever
-Spotify is idle. Pointing speakers at a dead URL just makes them error, so the
-controller polls the mount and only starts playback once it returns 200. If the
-stream later drops, it regroups when it comes back.
-
-It also rebuilds the zone when the speaker set changes. AllPlay discovery is
-asynchronous and speakers routinely appear after the initial window — in
-testing, three showed up within 20s and two more arrived afterwards.
+An Icecast mount has no source until ffmpeg connects, so it is dead whenever
+nothing is feeding it. Pointing speakers at a dead URL just makes them error, so
+the controller checks Icecast's status page and only starts playback once the
+mount is listed. It must not request the audio URL itself: that joins as a
+second listener and the rooms already playing hear a short silence, once per
+poll. If the stream later drops, playback starts again when it comes back, on
+the group that is already there.
 
 ## Build and deploy
 
@@ -94,9 +107,12 @@ curl http://<pi>:8080/skip
 curl http://<pi>:8080/seek
 curl http://<pi>:8080/stop
 curl http://<pi>:8080/play
+curl http://<pi>:8080/group   # every room that is on, right now
 ```
 
-Volume is applied to each speaker individually, scaled into that speaker's own
+`/status` lists the lead, the rooms in the group, and the rooms left out.
+
+Volume is applied to each speaker in the group, scaled into that speaker's own
 advertised range, so the rooms match rather than keeping whatever level each was
 last left at physically.
 
@@ -119,32 +135,35 @@ For unattended use the controller supervises its own state every `poll.seconds`:
   consecutive bad readings first, because speakers report `STOPPED` for a while
   as they open the stream and restarting on a single sample causes an audible
   glitch.
-- **Regrouping** - the zone is rebuilt whenever the known speaker set changes.
+- **The app's group is followed** - a group already on the speakers is not
+  rebuilt when a speaker appears or disappears. It is formed only when there is
+  none, or when `/group` asks for every room that is on. Shutdown does not
+  release it.
 - **Backoff** - repeated failures back off up to two minutes instead of
   hammering the speakers and filling the journal.
-- **Volume survives restarts** - volume, mute and band are persisted. librespot
+- **Volume survives restarts** - volume, mute, band and the remembered rooms are
+  persisted. librespot
   only emits `volume_changed` when the slider actually moves, so without this a
   restart resets to the default and nothing corrects it until someone touches
   the slider; that presents as the speakers being inaudible after a reboot.
 - **Clean shutdown** - cleanup runs on SIGTERM rather than from a JVM shutdown
   hook, because `alljoyn.jar` registers its own hook and JVM hooks run
-  concurrently in no defined order - so hook-based cleanup races AllJoyn tearing
-  the bus down and the zone release fails. It releases the zone, stops playback,
-  drops the speakers, then the bus.
+  concurrently in no defined order. It stops playback and drops the bus, and
+  leaves the speaker group in place.
 
 ## Options
 
 | Property | Default | Meaning |
 |---|---|---|
 | `stream.url` | `http://127.0.0.1:8000/spotify.mp3` | Stream for the speakers to play |
-| `master.name` | *(first found)* | Which speaker leads the zone |
+| `master.name` | *(current lead, else first found)* | Preferred lead when this controller forms a group, and which group to follow when several exist |
 | `volume` | `35` | Startup volume, 0-100 |
 | `control.port` | `8080` | HTTP control endpoint, `0` disables |
 | `volume.floor` | `0` | Bottom of the usable band, 0-100 |
 | `volume.ceiling` | `100` | Top of the usable band, 0-100 |
 | `discovery.seconds` | `25` | Initial discovery window |
 | `poll.seconds` | `12` | Supervision interval |
-| `state.file` | `allplay.state` | Remembers volume/mute/band across restarts |
+| `state.file` | `allplay.state` | Remembers volume/mute/band and the group across restarts |
 | `org.alljoyn.bus.address` | `null:` | Router to use |
 
 A loopback host in `stream.url` is rewritten to this host's LAN address, since

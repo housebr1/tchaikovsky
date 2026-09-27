@@ -10,6 +10,12 @@ When the FIFO is idle (Spotify paused), write silence at the same rate so
 ffmpeg keeps the Icecast connection alive. Otherwise the next real PCM hits a
 dead socket, ffmpeg dies (broken pipe), and the first track is silent until
 the encoder restarts.
+
+A short gap is not a pause. librespot's writes are bursty, and filling each
+20 ms hole with zeros puts that silence into the song. Wait it out instead.
+The speakers are already buffering, so a few hundred milliseconds of no new
+PCM is inaudible. Only a gap that lasts long enough to be a real pause is
+replaced with silence, and that run is logged.
 """
 from __future__ import print_function
 
@@ -22,6 +28,15 @@ RATE = 44100 * 2 * 2  # bytes/s: 44100 Hz, 2 ch, s16le
 BURST = RATE * 0.1  # 100 ms of credit, not the pause duration
 CHUNK = 4096
 SILENCE = b"\x00" * CHUNK
+# Shorter than this, just wait. Longer, the source is paused: keep Icecast up.
+IDLE_BEFORE_SILENCE = 0.40
+# Log stalls even when we do not insert silence, so a heard gap can be matched.
+LOG_WAIT = 0.08
+
+
+def note(message):
+    sys.stderr.write("[pace] " + message + "\n")
+    sys.stderr.flush()
 
 
 def main():
@@ -29,14 +44,29 @@ def main():
     stdout = sys.stdout.buffer
     tokens = BURST
     last = time.monotonic()
+    idle_since = None
+    silence_run = 0.0
     while True:
-        ready, _, _ = select.select([infd], [], [], 0.02)
+        ready, _, _ = select.select([infd], [], [], 0.05)
+        now = time.monotonic()
         if ready:
+            if silence_run > 0:
+                note("inserted %dms of silence" % int(silence_run * 1000))
+                silence_run = 0.0
+            elif idle_since is not None and now - idle_since >= LOG_WAIT:
+                note("pcm late %dms, not filled" % int((now - idle_since) * 1000))
+            idle_since = None
             data = os.read(infd, CHUNK)
             if not data:
                 data = SILENCE
+                silence_run += len(data) / float(RATE)
         else:
+            if idle_since is None:
+                idle_since = now
+            if now - idle_since < IDLE_BEFORE_SILENCE:
+                continue
             data = SILENCE
+            silence_run += len(data) / float(RATE)
         now = time.monotonic()
         tokens = min(BURST, tokens + (now - last) * RATE)
         last = now

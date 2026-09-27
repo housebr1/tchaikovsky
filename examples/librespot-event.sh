@@ -45,6 +45,11 @@
 #                                   it is a no-op while already streaming)
 #   track_changed     -> /skip     (re-opens the URL on the existing zone so the
 #                                   speakers drop the previous track's buffer)
+#                                   -- but NOT after end_of_track. A song that
+#                                   ends on its own is followed by the next one
+#                                   in the same stream; the speakers are still
+#                                   playing its last 15-20s, and a reopen cuts
+#                                   that off and re-buffers into silence.
 #   seeked            -> /seek     (same reopen; scrubbing otherwise leaves the
 #                                   speakers on the pre-seek Icecast buffer)
 #   volume_changed    -> /volume
@@ -52,6 +57,12 @@ set -uo pipefail
 
 CONTROL="${ALLPLAY_CONTROL:-http://127.0.0.1:8080}"
 LOG="${ALLPLAY_EVENT_LOG:-/tmp/librespot-events.log}"
+# Set by end_of_track; a track_changed shortly after it is a natural transition.
+ENDED="${ALLPLAY_ENDED_MARK:-/tmp/librespot-ended}"
+
+# Before the log line: librespot runs handlers without waiting, and the
+# track_changed that follows arrives in the same second.
+[[ "${PLAYER_EVENT:-}" == end_of_track ]] && touch "$ENDED"
 
 echo "$(date +%T) event=${PLAYER_EVENT:-?} volume=${VOLUME:-none}" >> "$LOG" 2>&1
 
@@ -74,9 +85,17 @@ case "${PLAYER_EVENT:-}" in
         call "resume"
         ;;
     track_changed)
-        # The controller ignores this while paused, so a skip made while paused
-        # does not start anything; the following resume plays the new track.
-        call "skip"
+        # Give a concurrent end_of_track handler time to leave its mark.
+        sleep 0.3
+        if [[ -e "$ENDED" ]] && (( $(date +%s) - $(stat -c %Y "$ENDED") <= 5 )); then
+            rm -f "$ENDED"
+            echo "$(date +%T) natural transition, stream kept" >> "$LOG"
+        else
+            rm -f "$ENDED"
+            # The controller ignores this while paused, so a skip made while
+            # paused does not start anything; the following resume plays it.
+            call "skip"
+        fi
         ;;
     seeked)
         call "seek"

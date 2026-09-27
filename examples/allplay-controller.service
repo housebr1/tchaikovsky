@@ -1,5 +1,5 @@
 [Unit]
-Description=AllPlay zone controller (groups speakers onto the Icecast stream)
+Description=AllPlay controller (plays Icecast on the current speaker group)
 Documentation=https://github.com/housebr1/tchaikovsky
 # Ordering only. The controller tolerates the mount 404ing and waits for it, so
 # Icecast being slow to start is not a failure.
