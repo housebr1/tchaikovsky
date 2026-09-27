@@ -95,6 +95,13 @@ public class AllPlayController {
     private static final int CONTROL_PORT = Integer.getInteger("control.port", 8080);
     private static final int MAX_BACKOFF_SECONDS = 120;
     private static final int GRACE_SECONDS = 40;
+    /**
+     * Periodic group scan while streaming; 0 = only at play, pause and resume.
+     * Not a cause of the in-song silences: those persisted with it off, and a
+     * dump of the Icecast mount had none mid-song (2026-09-27).
+     */
+    private static final int GROUP_SCAN_SECONDS = Integer.getInteger("group.scan.seconds", POLL_SECONDS);
+    private long lastGroupScanAt = 0;
     private static final String STATE_FILE =
             System.getProperty("state.file", "allplay.state");
 
@@ -269,13 +276,18 @@ public class AllPlayController {
             // Reopen when the lead is already there. Forming a group is the
             // audible tear-down, so it happens only when there is no group and
             // more remembered rooms are now on, or when reopen has no lead.
-            if (maybeMoreRooms() || !reopenStream("supervise")) {
+            if (maybeMoreRooms() || !reopenIfIdle("supervise")) {
                 startPlayback();
             }
         } else {
             // A new speaker must not rebuild the group. Follow a group the app
             // changed; form one only if the speakers report that there isn't one.
-            trackGroup();
+            long now = System.currentTimeMillis();
+            if (GROUP_SCAN_SECONDS > 0
+                    && now - lastGroupScanAt >= TimeUnit.SECONDS.toMillis(GROUP_SCAN_SECONDS)) {
+                lastGroupScanAt = now;
+                trackGroup();
+            }
             verifyPlayback();
         }
     }
@@ -690,9 +702,19 @@ public class AllPlayController {
     }
 
     /** Starts the stream on the lead of {@link #ensureGroup(boolean, Scan) ensureGroup(false, scan)}. */
+    /**
+     * Starts playback if nothing else has meanwhile. The scan runs unlocked, so
+     * the supervise pass and the resume thread can both get here; two playItem
+     * calls a second apart left the lead connected to nothing for 18s
+     * (17:43:51, 2026-09-27). The second caller must see streaming and stop.
+     */
     private void startPlayback() throws AllPlayException {
         Scan scan = scanForGroup();
         synchronized (this) {
+            if (streaming) {
+                log("playback already started elsewhere, not starting it again");
+                return;
+            }
             startPlaybackLocked(scan);
         }
     }
@@ -1111,7 +1133,20 @@ public class AllPlayController {
      * pause/play mint a new zone id every time (~17:11-17:12).
      */
     private boolean reopenStream(String reason) {
-        return reopenStream(reason, false);
+        return reopenStream(reason, false, false);
+    }
+
+    private boolean reopenStream(String reason, boolean coalesce) {
+        return reopenStream(reason, coalesce, false);
+    }
+
+    /**
+     * Start the stream only if it is not already playing. For supervise and
+     * resume, which decide on a stale "not streaming" before taking the lock.
+     * Skip, seek and the watchdog must reopen regardless and do not use this.
+     */
+    private boolean reopenIfIdle(String reason) {
+        return reopenStream(reason, false, true);
     }
 
     /**
@@ -1119,10 +1154,14 @@ public class AllPlayController {
      * (usually the group scan). playItem is how long the speaker call itself
      * took. A wait of many seconds is a mid-song hole: the reopen lands late.
      */
-    private boolean reopenStream(String reason, boolean coalesce) {
+    private boolean reopenStream(String reason, boolean coalesce, boolean ifIdle) {
         long requested = System.currentTimeMillis();
         synchronized (this) {
             long waited = System.currentTimeMillis() - requested;
+            if (ifIdle && streaming) {
+                log(reason + ": already playing, not reopening (waited " + waited + "ms)");
+                return true;
+            }
             Speaker current = master;
             if (current == null || !current.isConnected()) {
                 if (waited >= 200) {
@@ -1182,7 +1221,7 @@ public class AllPlayController {
         }
         // A group that is already there is reopened, not rebuilt. Look again
         // only when more remembered rooms have shown up than the live group has.
-        if (!maybeMoreRooms() && reopenStream(reason)) {
+        if (!maybeMoreRooms() && reopenIfIdle(reason)) {
             return "resumed\n";
         }
         resumeNow();
@@ -1207,7 +1246,7 @@ public class AllPlayController {
                     }
                     try {
                         if (isStreamLive()) {
-                            if (maybeMoreRooms() || !reopenStream("resume")) {
+                            if (maybeMoreRooms() || !reopenIfIdle("resume")) {
                                 startPlayback();
                             }
                             return;

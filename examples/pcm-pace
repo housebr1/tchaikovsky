@@ -47,7 +47,10 @@ def main():
     idle_since = None
     silence_run = 0.0
     while True:
-        ready, _, _ = select.select([infd], [], [], 0.05)
+        # Must be shorter than one CHUNK of audio (23ms). While idle, each pass
+        # writes one CHUNK of silence, so a 50ms timeout fed Icecast at 0.46x
+        # real time. The token bucket, not this timeout, sets the rate.
+        ready, _, _ = select.select([infd], [], [], 0.02)
         now = time.monotonic()
         if ready:
             if silence_run > 0:
