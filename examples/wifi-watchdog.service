@@ -1,0 +1,12 @@
+[Unit]
+Description=Reconnect Wi-Fi, then reboot, when the gateway stops answering
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+ExecStart=/usr/local/sbin/wifi-watchdog.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

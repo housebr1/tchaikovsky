@@ -1,0 +1,6 @@
+[Unit]
+Description=Nightly reboot (works around the Pi dropping off the network after ~a day)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl reboot
